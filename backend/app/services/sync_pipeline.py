@@ -37,6 +37,37 @@ def _has_audio_stream(path: Path) -> bool:
     return result.returncode == 0 and "audio" in result.stdout
 
 
+def _repair_binary_concat(raw_combined_path: Path, repaired_path: Path, has_audio: bool) -> bool:
+    """Try binary concatenation + ffmpeg repair if concat filter fails."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts+igndts+discardcorrupt",
+        "-analyzeduration", "100M",
+        "-probesize", "100M",
+        "-i", str(raw_combined_path),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+    ]
+    if has_audio:
+        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+    else:
+        cmd.append("-an")
+
+    cmd.extend(["-movflags", "+faststart", str(repaired_path)])
+    logger.info(
+        f"Attempting binary concat repair for {raw_combined_path.name} -> {repaired_path.name}"
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(
+            f"Binary concat repair failed: {result.stderr[-1000:]}"
+        )
+        return False
+    return repaired_path.exists() and repaired_path.stat().st_size > 0
+
+
 def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str, Path]:
     """
     Concatenate all chunks for each camera into a single full video.
@@ -130,12 +161,27 @@ def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str
         ):
             logger.info(f"✅ Concat filter succeeded for {cam_id} -> {repaired_path}")
             full_videos[cam_id] = repaired_path
+            continue
+
+        # Last 1000 chars often cuts off the real cause — give ourselves room.
+        logger.error(
+            f"Concat filter failed for {cam_id} (returncode={res.returncode})\n"
+            f"STDERR (last 3000 chars):\n{res.stderr[-3000:]}"
+        )
+
+        raw_combined_path = session_dir / f"raw_combined_{cam_id}.mp4"
+        logger.info(f"[{cam_id}] Falling back to binary concat repair")
+        with open(raw_combined_path, "wb") as outfile:
+            for chunk in chunk_paths:
+                with open(chunk, "rb") as infile:
+                    outfile.write(infile.read())
+
+        if _repair_binary_concat(raw_combined_path, repaired_path, all_have_audio):
+            logger.info(f"✅ Binary concat repair succeeded for {cam_id} -> {repaired_path}")
+            raw_combined_path.unlink(missing_ok=True)
+            full_videos[cam_id] = repaired_path
         else:
-            # Last 1000 chars often cuts off the real cause — give ourselves room.
-            logger.error(
-                f"Concat filter failed for {cam_id} (returncode={res.returncode})\n"
-                f"STDERR (last 3000 chars):\n{res.stderr[-3000:]}"
-            )
+            logger.error(f"[{cam_id}] Binary concat fallback also failed")
 
     return full_videos
 
