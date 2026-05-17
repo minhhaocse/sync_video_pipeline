@@ -68,6 +68,33 @@ def _repair_binary_concat(raw_combined_path: Path, repaired_path: Path, has_audi
     return repaired_path.exists() and repaired_path.stat().st_size > 0
 
 
+def _remux_to_mp4(input_path: Path, output_path: Path) -> bool:
+    has_audio = _has_audio_stream(input_path)
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts+igndts+discardcorrupt",
+        "-analyzeduration", "100M",
+        "-probesize", "100M",
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+    ]
+    if has_audio:
+        cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+    else:
+        cmd.append("-an")
+    cmd.extend(["-movflags", "+faststart", str(output_path)])
+
+    logger.info(f"Remuxing direct input {input_path.name} -> {output_path.name}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"Remux failed: {result.stderr[-1000:]}")
+        return False
+    return output_path.exists() and output_path.stat().st_size > 0
+
+
 def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str, Path]:
     """
     Concatenate all chunks for each camera into a single full video.
@@ -81,107 +108,159 @@ def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str
     a video-only concat for that camera — the alternative is FFmpeg
     aborting with "Stream specifier ':a' matches no streams".
 
+    When no chunk directories exist, the pipeline can also process direct
+    full video inputs from the session directory.
+
     Returns dict cam_id -> full_video_path
     """
     full_videos: dict[str, Path] = {}
+
+    direct_video_paths: dict[str, Path] = {}
+    for cam_id in cam_id_list:
+        for ext in [".mp4", ".mkv", ".mov", ".webm"]:
+            candidate = session_dir / f"{cam_id}{ext}"
+            if candidate.exists():
+                direct_video_paths[cam_id] = candidate
+                break
+
+    if len(direct_video_paths) == len(cam_id_list):
+        logger.info("Direct full-video inputs detected for all requested cameras. Skipping chunk concatenation.")
+        for cam_id, video_path in direct_video_paths.items():
+            if video_path.suffix.lower() == ".mp4":
+                full_videos[cam_id] = video_path
+                continue
+
+            repaired_path = session_dir / f"full_{cam_id}.mp4"
+            if _remux_to_mp4(video_path, repaired_path):
+                logger.info(f"✅ Remux succeeded for {cam_id} -> {repaired_path}")
+                full_videos[cam_id] = repaired_path
+            else:
+                logger.error(f"❌ Remux failed for {cam_id}. Skipping this camera.")
+        return full_videos
 
     chunk_dirs = sorted(
         [d for d in session_dir.glob("chunk_*") if d.is_dir()],
         key=lambda d: int(d.name.split("_")[1]),
     )
 
-    for cam_id in cam_id_list:
-        chunk_paths: list[Path] = []
-        for chunk_dir in chunk_dirs:
-            # Check for .mkv (live) or .mp4 (manual upload)
-            chunk_file = chunk_dir / f"{cam_id}.mkv"
-            if not chunk_file.exists():
-                chunk_file = chunk_dir / f"{cam_id}.mp4"
-            if chunk_file.exists():
-                chunk_paths.append(chunk_file)
+    if chunk_dirs:
+        for cam_id in cam_id_list:
+            chunk_paths: list[Path] = []
+            for chunk_dir in chunk_dirs:
+                # Check for .mkv (live) or .mp4 (manual upload)
+                chunk_file = chunk_dir / f"{cam_id}.mkv"
+                if not chunk_file.exists():
+                    chunk_file = chunk_dir / f"{cam_id}.mp4"
+                if chunk_file.exists():
+                    chunk_paths.append(chunk_file)
 
-        if not chunk_paths:
-            logger.warning(f"No chunks found for cam {cam_id}")
-            continue
+            if not chunk_paths:
+                logger.warning(f"No chunks found for cam {cam_id}")
+                continue
 
-        n = len(chunk_paths)
-        repaired_path = session_dir / f"full_{cam_id}.mp4"
-        logger.info(f"[{cam_id}] Starting concat-filter for {n} chunks")
+            n = len(chunk_paths)
+            repaired_path = session_dir / f"full_{cam_id}.mp4"
+            logger.info(f"[{cam_id}] Starting concat-filter for {n} chunks")
 
-        # Only include audio if EVERY input has it — concat filter requires
-        # every input to expose every mapped stream type.
-        all_have_audio = all(_has_audio_stream(p) for p in chunk_paths)
-        if not all_have_audio:
-            logger.warning(
-                f"[{cam_id}] One or more chunks lack an audio stream; "
-                f"falling back to video-only concat"
+            # Only include audio if EVERY input has it — concat filter requires
+            # every input to expose every mapped stream type.
+            all_have_audio = all(_has_audio_stream(p) for p in chunk_paths)
+            if not all_have_audio:
+                logger.warning(
+                    f"[{cam_id}] One or more chunks lack an audio stream; "
+                    f"falling back to video-only concat"
+                )
+
+            cmd: list[str] = [
+                "ffmpeg", "-y",
+                "-fflags", "+genpts+igndts+discardcorrupt",
+                "-analyzeduration", "100M",
+                "-probesize", "100M",
+            ]
+            for p in chunk_paths:
+                cmd.extend(["-i", str(p)])
+
+            if all_have_audio:
+                inputs = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
+                filter_complex = f"{inputs}concat=n={n}:v=1:a=1[v][a]"
+                maps = ["-map", "[v]", "-map", "[a]"]
+                audio_args = ["-c:a", "aac", "-b:a", "128k"]
+            else:
+                inputs = "".join(f"[{i}:v:0]" for i in range(n))
+                filter_complex = f"{inputs}concat=n={n}:v=1:a=0[v]"
+                maps = ["-map", "[v]"]
+                audio_args = ["-an"]
+
+            cmd.extend([
+                "-filter_complex", filter_complex,
+                *maps,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                *audio_args,
+                "-movflags", "+faststart",
+                str(repaired_path),
+            ])
+
+            logger.info(
+                f"[{cam_id}] Running concat filter ({n} inputs, audio={all_have_audio})"
+            )
+            res = subprocess.run(cmd, capture_output=True, text=True)
+
+            if (
+                res.returncode == 0
+                and repaired_path.exists()
+                and repaired_path.stat().st_size > 0
+            ):
+                logger.info(f"✅ Concat filter succeeded for {cam_id} -> {repaired_path}")
+                full_videos[cam_id] = repaired_path
+                continue
+
+            logger.error(
+                f"Concat filter failed for {cam_id} (returncode={res.returncode})\n"
+                f"STDERR (last 3000 chars):\n{res.stderr[-3000:]}"
             )
 
-        cmd: list[str] = [
-            "ffmpeg", "-y",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-analyzeduration", "100M",
-            "-probesize", "100M",
-        ]
-        for p in chunk_paths:
-            cmd.extend(["-i", str(p)])
+            raw_combined_path = session_dir / f"raw_combined_{cam_id}.mp4"
+            logger.info(f"[{cam_id}] Falling back to binary concat repair")
+            with open(raw_combined_path, "wb") as outfile:
+                for chunk in chunk_paths:
+                    with open(chunk, "rb") as infile:
+                        outfile.write(infile.read())
 
-        if all_have_audio:
-            inputs = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
-            filter_complex = f"{inputs}concat=n={n}:v=1:a=1[v][a]"
-            maps = ["-map", "[v]", "-map", "[a]"]
-            audio_args = ["-c:a", "aac", "-b:a", "128k"]
-        else:
-            inputs = "".join(f"[{i}:v:0]" for i in range(n))
-            filter_complex = f"{inputs}concat=n={n}:v=1:a=0[v]"
-            maps = ["-map", "[v]"]
-            audio_args = ["-an"]
+            if _repair_binary_concat(raw_combined_path, repaired_path, all_have_audio):
+                logger.info(f"✅ Binary concat repair succeeded for {cam_id} -> {repaired_path}")
+                raw_combined_path.unlink(missing_ok=True)
+                full_videos[cam_id] = repaired_path
+            else:
+                logger.error(f"[{cam_id}] Binary concat fallback also failed")
 
-        cmd.extend([
-            "-filter_complex", filter_complex,
-            *maps,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            *audio_args,
-            "-movflags", "+faststart",
-            str(repaired_path),
-        ])
+        return full_videos
 
-        logger.info(
-            f"[{cam_id}] Running concat filter ({n} inputs, audio={all_have_audio})"
-        )
-        res = subprocess.run(cmd, capture_output=True, text=True)
+    logger.info(f"No chunk directories found in {session_dir}. Checking for direct full session files.")
+    for cam_id in cam_id_list:
+        video_path = None
+        for ext in [".mp4", ".mkv", ".mov", ".webm"]:
+            candidate = session_dir / f"{cam_id}{ext}"
+            if candidate.exists():
+                video_path = candidate
+                break
 
-        if (
-            res.returncode == 0
-            and repaired_path.exists()
-            and repaired_path.stat().st_size > 0
-        ):
-            logger.info(f"✅ Concat filter succeeded for {cam_id} -> {repaired_path}")
-            full_videos[cam_id] = repaired_path
+        if not video_path:
+            logger.warning(f"No direct full video found for cam {cam_id}")
             continue
 
-        # Last 1000 chars often cuts off the real cause — give ourselves room.
-        logger.error(
-            f"Concat filter failed for {cam_id} (returncode={res.returncode})\n"
-            f"STDERR (last 3000 chars):\n{res.stderr[-3000:]}"
-        )
+        if video_path.suffix.lower() == ".mp4":
+            full_videos[cam_id] = video_path
+            continue
 
-        raw_combined_path = session_dir / f"raw_combined_{cam_id}.mp4"
-        logger.info(f"[{cam_id}] Falling back to binary concat repair")
-        with open(raw_combined_path, "wb") as outfile:
-            for chunk in chunk_paths:
-                with open(chunk, "rb") as infile:
-                    outfile.write(infile.read())
-
-        if _repair_binary_concat(raw_combined_path, repaired_path, all_have_audio):
-            logger.info(f"✅ Binary concat repair succeeded for {cam_id} -> {repaired_path}")
-            raw_combined_path.unlink(missing_ok=True)
+        repaired_path = session_dir / f"full_{cam_id}.mp4"
+        if _remux_to_mp4(video_path, repaired_path):
+            logger.info(f"✅ Remux succeeded for {cam_id} -> {repaired_path}")
             full_videos[cam_id] = repaired_path
         else:
-            logger.error(f"[{cam_id}] Binary concat fallback also failed")
+            logger.error(f"❌ Remux failed for {cam_id}. Skipping this camera.")
 
     return full_videos
 
@@ -230,11 +309,15 @@ def run_full_sync_pipeline(
     # step can find them with their canonical name. replace() is atomic on
     # POSIX and (unlike rename()) overwrites an existing target, which matters
     # on retries where a stale file may already be there.
+    canonical_paths: dict[str, Path] = {}
     for cam_id, path in full_videos.items():
         new_path = session_dir / f"{cam_id}.mp4"
         if path != new_path:
             logger.debug(f"[{session_id}] Renaming {path.name} -> {new_path.name}")
+            if new_path.exists():
+                new_path.unlink(missing_ok=True)
             path.replace(new_path)
+        canonical_paths[cam_id] = new_path
 
     # Step 2: Compute offsets using full videos
     logger.info(
@@ -266,7 +349,7 @@ def run_full_sync_pipeline(
 
     aligned_paths: dict[str, Path] = {}
     for cam_id, offset in offsets.items():
-        input_path = session_dir / f"{cam_id}.mp4"
+        input_path = canonical_paths.get(cam_id, session_dir / f"{cam_id}.mp4")
         aligned_file_path = aligned_dir / f"{cam_id}_aligned.mp4"
         if input_path.exists():
             # chunk_index=0 keeps repair logic happy for the full-video case;

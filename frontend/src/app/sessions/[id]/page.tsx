@@ -20,74 +20,81 @@ export default function SessionDetailPage() {
 
   const { data: session, error, isLoading, mutate } = useSWR(id ? `session-${id}` : null, () => fetcher(id));
   const { data: offsets } = useSWR(id ? `offsets-${id}` : null, () => offsetFetcher(id));
-  const { data: initialChunks } = useSWR(id ? `chunks-${id}` : null, () => api.sessions.chunks(id));
   const { events, connected } = useWebSocket(id);
 
   const [currentVideoUrl, setCurrentVideoUrl] = useState<string | null>(null);
-  const [processedChunks, setProcessedChunks] = useState<number[]>([]);
-  const [chunkProgress, setChunkProgress] = useState<Record<number, string>>({});
+  const [progressStage, setProgressStage] = useState<string>("queued");
+  const [progressMessage, setProgressMessage] = useState<string>("Waiting for backend sync to begin...");
   const [deleting, setDeleting] = useState(false);
 
-  // Monitor events for toast notifications and player updates
   useEffect(() => {
-    setChunkProgress(prev => {
-      const next = { ...prev };
-      let changed = false;
-      events.forEach(ev => {
-        if (ev.chunk_index !== undefined && ["processing_started", "computing_offsets", "aligning", "stitching", "chunk_done", "error"].includes(ev.type)) {
-          if (next[ev.chunk_index] === "chunk_done" || next[ev.chunk_index] === "error") return;
-          if (next[ev.chunk_index] !== ev.type) {
-            next[ev.chunk_index] = ev.type;
-            changed = true;
-          }
-        }
-      });
-      return changed ? next : prev;
+    if (!events || events.length === 0) return;
+
+    const progressOrder = [
+      "queued",
+      "master_started",
+      "concatenating",
+      "computing_offsets",
+      "aligning",
+      "master_done",
+      "master_error",
+    ];
+
+    let latestStage = "queued";
+    let latestMessage = "Waiting for backend sync to begin...";
+    let latestUrl: string | null = null;
+
+    events.forEach((ev) => {
+      switch (ev.type) {
+        case "master_error":
+          latestStage = "master_error";
+          latestMessage = ev.message || "Full sync failed.";
+          break;
+        case "master_done":
+          latestStage = "master_done";
+          latestMessage = ev.message || "Master video is ready.";
+          latestUrl = ev.url || latestUrl;
+          break;
+        case "aligning":
+          latestStage = "aligning";
+          latestMessage = ev.message || "Trimming and aligning video streams...";
+          break;
+        case "computing_offsets":
+          latestStage = "computing_offsets";
+          latestMessage = ev.message || "Computing offsets...";
+          break;
+        case "concatenating":
+          latestStage = "concatenating";
+          latestMessage = ev.message || "Concatenating source videos...";
+          break;
+        case "master_started":
+        case "processing_started":
+          latestStage = "master_started";
+          latestMessage = ev.message || "Building final synced video...";
+          break;
+        default:
+          break;
+      }
     });
+
+    setProgressStage(latestStage);
+    setProgressMessage(latestMessage);
+
+    if (!currentVideoUrl && latestUrl) {
+      setCurrentVideoUrl(latestUrl);
+    }
 
     const lastEvent = events[events.length - 1];
     if (!lastEvent) return;
 
-    if (lastEvent.type === "chunk_done" && lastEvent.chunk_index !== undefined) {
-      if (!processedChunks.includes(lastEvent.chunk_index)) {
-        addToast({ type: "success", title: "Chunk Synced", message: `Chunk #${lastEvent.chunk_index} is ready for playback.` });
-        
-        setProcessedChunks((prev) => {
-          const next = [...prev, lastEvent.chunk_index!].sort((a, b) => a - b);
-          // Auto-play the newest chunk if nothing is playing
-          if (!currentVideoUrl && lastEvent.url) {
-            setCurrentVideoUrl(lastEvent.url);
-          }
-          return next;
-        });
-      }
-    } else if (lastEvent.type === "processing_started") {
-      addToast({ type: "info", title: "Processing Started", message: `Syncing Chunk #${lastEvent.chunk_index}...` });
-    } else if (lastEvent.type === "error") {
+    if (lastEvent.type === "master_error") {
       addToast({ type: "error", title: "Sync Error", message: lastEvent.message || "Pipeline encountered an error." });
+    } else if (lastEvent.type === "master_done") {
+      addToast({ type: "success", title: "Sync Completed", message: "Final master video is ready." });
+    } else if (lastEvent.type === "master_started") {
+      addToast({ type: "info", title: "Sync Started", message: "Final master sync has started." });
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events]);
-
-  useEffect(() => {
-    if (initialChunks && initialChunks.length > 0) {
-      setProcessedChunks(prev => {
-        const set = new Set([...prev, ...initialChunks]);
-        return Array.from(set).sort((a,b) => a-b);
-      });
-      setChunkProgress(prev => {
-        const next = { ...prev };
-        let changed = false;
-        initialChunks.forEach(idx => {
-          if (next[idx] !== "chunk_done") {
-             next[idx] = "chunk_done";
-             changed = true;
-          }
-        });
-        return changed ? next : prev;
-      });
-    }
-  }, [initialChunks]);
+  }, [events, currentVideoUrl, addToast]);
 
   const handleDelete = async () => {
     if (!session) return;
@@ -190,86 +197,59 @@ export default function SessionDetailPage() {
           <div style={{ display: "flex", flexDirection: "column", gap: 32 }}>
             <SyncedPlayer
               url={currentVideoUrl}
-              title={`Live Monitor — Chunk #${processedChunks[processedChunks.length - 1] ?? "..."}`}
+              title={currentVideoUrl ? "Final Master Video" : "Final Sync Monitor"}
             />
 
             <div className="card">
-              <div className="card-header">
-                <h3 className="card-title"><span style={{ fontSize: 20, marginRight: 8 }}>📦</span> Synced Chunks</h3>
-                <span className="badge badge-uploaded" style={{ background: "transparent", border: "none" }}>
-                  {processedChunks.length} Total
+              <div className="card-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <h3 className="card-title"><span style={{ fontSize: 20, marginRight: 8 }}>🚧</span> Backend Sync Progress</h3>
+                <span className={`badge badge-${session.status}`} style={{ background: "transparent", border: "none" }}>
+                  {session.status.toUpperCase()}
                 </span>
               </div>
-              
-              {Object.keys(chunkProgress).length === 0 ? (
-                <div style={{ color: "var(--text-muted)", fontSize: 14, textAlign: "center", padding: "60px 20px", border: "1px dashed var(--border)", borderRadius: "var(--radius-sm)" }}>
-                  <div style={{ fontSize: 32, marginBottom: 12 }}>⏳</div>
-                  No synced chunks yet.<br/>Ensure capture nodes are actively uploading.
-                </div>
-              ) : (
-                <div className="grid-4" style={{ gridTemplateColumns: "1fr" }}>
-                  {Object.entries(chunkProgress).sort(([a], [b]) => Number(a) - Number(b)).map(([idxStr, status]) => {
-                    const idx = Number(idxStr);
-                    const isActive = currentVideoUrl?.includes(`synced_chunk_${idx}.mp4`);
-                    const isDone = status === "chunk_done";
-                    const isError = status === "error";
-                    
-                    const progressSteps = ["processing_started", "computing_offsets", "aligning", "stitching", "chunk_done"];
-                    let progressIndex = progressSteps.indexOf(status);
-                    if (progressIndex === -1) progressIndex = 0;
-                    const progressPercent = isError ? 100 : ((progressIndex + 1) / progressSteps.length) * 100;
-                    
+
+              <div style={{ padding: "24px 0 0" }}>
+                <div style={{ display: "grid", gap: 16 }}>
+                  {[
+                    { key: "master_started", label: "Start full sync" },
+                    { key: "concatenating", label: "Concatenate source videos" },
+                    { key: "computing_offsets", label: "Compute camera offsets" },
+                    { key: "aligning", label: "Align and trim streams" },
+                    { key: "master_done", label: "Final master ready" },
+                  ].map((step, index) => {
+                    const stageOrder = ["queued", "master_started", "concatenating", "computing_offsets", "aligning", "master_done", "master_error"];
+                    const currentIndex = stageOrder.indexOf(progressStage);
+                    const stepIndex = stageOrder.indexOf(step.key);
+                    const isCompleted = currentIndex > stepIndex || progressStage === "master_done";
+                    const isCurrent = progressStage === step.key;
+                    const isErrored = progressStage === "master_error" && step.key === "master_done";
+
                     return (
-                      <div key={idx} style={{ marginBottom: 12 }}>
-                        <button
-                          className={`card interactive ${isActive ? "active" : ""}`}
-                          onClick={() => { if (isDone) setCurrentVideoUrl(`/static/synced/${session.id}/synced_chunk_${idx}.mp4`) }}
-                          disabled={!isDone}
-                          style={{
-                            width: "100%",
-                            padding: 16,
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "space-between",
-                            background: isActive ? "rgba(59,130,246,0.15)" : "rgba(0,0,0,0.2)",
-                            borderColor: isActive ? "var(--accent-blue)" : (isError ? "var(--accent-red)" : "var(--border)"),
-                            boxShadow: isActive ? "var(--shadow-glow)" : "none",
-                            cursor: isDone ? "pointer" : "default",
-                            opacity: isDone || isError ? 1 : 0.8
-                          }}
-                        >
-                          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                            <div style={{ fontSize: 24, opacity: isDone ? 1 : 0.5 }}>{isError ? "❌" : (isDone ? "🎞️" : "⏳")}</div>
-                            <div style={{ textAlign: "left" }}>
-                              <div style={{ fontSize: 13, fontWeight: 700, color: isActive ? "var(--text-primary)" : "var(--text-secondary)" }}>
-                                CHUNK #{idx}
-                              </div>
-                              <div style={{ fontSize: 11, color: isError ? "var(--accent-red)" : "var(--text-muted)", marginTop: 2 }}>
-                                {isError ? "Error" : status.replace("_", " ").toUpperCase()}
-                              </div>
-                            </div>
-                          </div>
-                          {!isDone && !isError && (
-                            <div className="skeleton pulse" style={{ width: 24, height: 24, borderRadius: "50%", background: "var(--accent-blue)" }} />
-                          )}
-                        </button>
-                        
-                        {/* Progress Bar */}
-                        {!isDone && !isError && (
-                          <div style={{ width: "100%", height: 4, background: "rgba(255,255,255,0.1)", borderRadius: 2, marginTop: 4, overflow: "hidden" }}>
-                            <div style={{ height: "100%", width: `${progressPercent}%`, background: "var(--accent-blue)", transition: "width 0.3s ease" }} />
-                          </div>
-                        )}
-                        {isError && (
-                          <div style={{ width: "100%", height: 4, background: "rgba(255,255,255,0.1)", borderRadius: 2, marginTop: 4, overflow: "hidden" }}>
-                            <div style={{ height: "100%", width: "100%", background: "var(--accent-red)" }} />
-                          </div>
-                        )}
+                      <div key={step.key} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <span style={{ fontWeight: 700, color: isCurrent ? "var(--text-primary)" : "var(--text-secondary)" }}>{step.label}</span>
+                          <span style={{ fontSize: 12, color: isCompleted ? "var(--accent-green)" : isCurrent ? "var(--accent-amber)" : "var(--text-muted)" }}>
+                            {isCompleted ? "Completed" : isCurrent ? "In progress" : "Pending"}
+                          </span>
+                        </div>
+                        <div style={{ width: "100%", height: 10, background: "rgba(255,255,255,0.1)", borderRadius: 999 }}>
+                          <div style={{ width: isCompleted ? "100%" : isCurrent ? "50%" : "0%", height: "100%", transition: "width 0.3s ease", background: isErrored ? "var(--accent-red)" : "var(--accent-blue)" }} />
+                        </div>
                       </div>
                     );
                   })}
                 </div>
-              )}
+
+                <div style={{ marginTop: 24, padding: 16, borderRadius: 12, background: "rgba(255,255,255,0.03)", border: "1px solid var(--border)" }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Current Step</div>
+                  <div style={{ fontSize: 14, color: "var(--text-secondary)" }}>{progressMessage}</div>
+                  {currentVideoUrl && (
+                    <div style={{ marginTop: 12 }}>
+                      <button className="btn btn-primary" style={{ padding: "10px 16px", fontSize: 13 }} onClick={() => window.open(currentVideoUrl, "_blank")}>Watch final video</button>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -299,7 +279,7 @@ export default function SessionDetailPage() {
               ) : (
                 <div style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", padding: "30px 20px", background: "rgba(0,0,0,0.2)", borderRadius: 6 }}>
                   <div className="skeleton" style={{ width: 24, height: 24, borderRadius: "50%", margin: "0 auto 12px", animation: "pulse 1.5s infinite" }} />
-                  Computing...<br/>Waiting for Chunk #0 from all cameras.
+                  Computing...<br/>Waiting for final sync and offset computation.
                 </div>
               )}
             </div>
@@ -312,8 +292,10 @@ export default function SessionDetailPage() {
               <div style={{ flexGrow: 1, maxHeight: 380, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, paddingRight: 8 }}>
                 {events.slice().reverse().map((ev, i) => {
                   let accent = "var(--border)";
-                  if (ev.type === "chunk_done") accent = "var(--accent-green)";
-                  if (ev.type === "error") accent = "var(--accent-red)";
+                  if (ev.type === "master_done" || ev.type === "chunk_done") accent = "var(--accent-green)";
+                  if (ev.type === "master_error" || ev.type === "error") accent = "var(--accent-red)";
+                  if (ev.type === "master_started" || ev.type === "processing_started" || ev.type === "concatenating" || ev.type === "computing_offsets" || ev.type === "aligning") accent = "var(--accent-amber)";
+                  if (ev.type === "chunk_uploaded") accent = "var(--accent-blue)";
                   if (ev.type === "processing_started") accent = "var(--accent-amber)";
                   if (ev.type === "chunk_uploaded") accent = "var(--accent-blue)";
 

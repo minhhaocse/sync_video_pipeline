@@ -22,7 +22,7 @@ from app.routers import live
 print("!!! DEBUG: Live Router imported", flush=True)
 
 print("!!! DEBUG: Importing other Routers", flush=True)
-from app.routers import upload, sessions, ws, simulate
+from app.routers import sessions, ws, simulate
 print("!!! DEBUG: All Routers imported", flush=True)
 
 from app.ws.manager import manager
@@ -147,7 +147,6 @@ async def log_requests(request: Request, call_next):
 
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-app.include_router(upload.router)
 app.include_router(sessions.router)
 app.include_router(live.router) # MP_web live streaming logic
 app.include_router(live.ws_router) # WebSocket endpoints (no prefix)
