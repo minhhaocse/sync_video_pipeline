@@ -21,6 +21,7 @@ class SessionOut(BaseModel):
     layout: str
     created_at: datetime
     updated_at: datetime
+    master_url: str | None = None
 
     model_config = {"from_attributes": True}
 

@@ -96,6 +96,14 @@ export default function SessionDetailPage() {
     }
   }, [events, currentVideoUrl, addToast]);
 
+  useEffect(() => {
+    if (session?.master_url && !currentVideoUrl) {
+      setCurrentVideoUrl(session.master_url);
+      setProgressStage("master_done");
+      setProgressMessage("Final master video is ready.");
+    }
+  }, [session, currentVideoUrl]);
+
   const handleDelete = async () => {
     if (!session) return;
     if (!confirm(`Permanently delete "${session.name}"? All raw and synced files will be lost.`)) return;
@@ -211,7 +219,7 @@ export default function SessionDetailPage() {
               <div style={{ padding: "24px 0 0" }}>
                 <div style={{ display: "grid", gap: 16 }}>
                   {[
-                    { key: "master_started", label: "Start full sync" },
+                    { key: "master_started", label: "Begin full sync" },
                     { key: "concatenating", label: "Concatenate source videos" },
                     { key: "computing_offsets", label: "Compute camera offsets" },
                     { key: "aligning", label: "Align and trim streams" },
@@ -255,35 +263,6 @@ export default function SessionDetailPage() {
 
           {/* Right Column: Metadata & Offsets */}
           <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-            {/* Offset Data */}
-            <div className="card">
-              <h3 className="card-title" style={{ marginBottom: 8 }}>⏱️ Camera Alignments</h3>
-              <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 20, lineHeight: 1.5 }}>
-                Computed via audio cross-correlation against the reference node.
-              </p>
-              
-              {offsets && offsets.length > 0 ? (
-                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                  {offsets.map((off: Offset) => (
-                    <div key={off.cam_id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 12px", background: "rgba(0,0,0,0.2)", borderRadius: 6, border: "1px solid var(--border)" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span style={{ fontSize: 16 }}>📸</span>
-                        <span className="mono" style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>{off.cam_id}</span>
-                      </div>
-                      <span className="mono" style={{ fontSize: 13, padding: "4px 8px", borderRadius: 4, background: off.offset_seconds >= 0 ? "rgba(245, 158, 11, 0.1)" : "rgba(6, 182, 212, 0.1)", color: off.offset_seconds >= 0 ? "var(--accent-amber)" : "var(--accent-cyan)" }}>
-                        {off.offset_seconds > 0 ? "+" : ""}{off.offset_seconds.toFixed(3)}s
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", padding: "30px 20px", background: "rgba(0,0,0,0.2)", borderRadius: 6 }}>
-                  <div className="skeleton" style={{ width: 24, height: 24, borderRadius: "50%", margin: "0 auto 12px", animation: "pulse 1.5s infinite" }} />
-                  Computing...<br/>Waiting for final sync and offset computation.
-                </div>
-              )}
-            </div>
-
             {/* Event Feed */}
             <div className="card" style={{ flexGrow: 1, display: "flex", flexDirection: "column" }}>
               <div className="card-header" style={{ marginBottom: 12, borderBottom: "1px solid var(--border)", paddingBottom: 16 }}>

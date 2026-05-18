@@ -30,7 +30,20 @@ async def create_session(data: SessionCreate, db: AsyncSession = Depends(get_db)
         await db.refresh(session)
         log_diag(f"✅ Session created successfully in DB: {session.id}")
         logger.info(f"✅ Session created: {session.id}")
-        return session
+        
+        # Construct response with master_url (will be None for new sessions)
+        response_data = {
+            "id": session.id,
+            "name": session.name,
+            "camera_count": session.camera_count,
+            "status": session.status,
+            "sync_strategy": session.sync_strategy,
+            "layout": session.layout,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "master_url": None,
+        }
+        return SessionOut(**response_data)
     except Exception as e:
         log_diag(f"❌ ERROR in create_session: {e}")
         logger.error(f"❌ Failed to create session in DB: {e}", exc_info=True)
@@ -45,20 +58,36 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
 ):
     try:
+        from sqlalchemy.orm import joinedload
+        
         log_diag(f"🔍 Listing sessions: skip={skip}, limit={limit}")
         result = await db.execute(
-            select(Session).order_by(Session.created_at.desc()).offset(skip).limit(limit)
+            select(Session)
+            .order_by(Session.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+            .options(joinedload(Session.master_video))
         )
-        items = result.scalars().all()
+        items = result.scalars().unique().all()
         log_diag(f"✅ Found {len(items)} sessions")
         
-        from fastapi.encoders import jsonable_encoder
-        import json
+        # Construct response with master_url included
+        response_items = []
+        for session in items:
+            response_data = {
+                "id": session.id,
+                "name": session.name,
+                "camera_count": session.camera_count,
+                "status": session.status,
+                "sync_strategy": session.sync_strategy,
+                "layout": session.layout,
+                "created_at": session.created_at,
+                "updated_at": session.updated_at,
+                "master_url": session.master_video.url if session.master_video else None,
+            }
+            response_items.append(SessionOut(**response_data))
         
-        serialized = jsonable_encoder(items)
-        log_diag(f"📝 Full Response Body: {json.dumps(serialized)}")
-        
-        return items
+        return response_items
     except Exception as e:
         log_diag(f"❌ ERROR in list_sessions: {e}")
         import traceback
@@ -68,10 +97,27 @@ async def list_sessions(
 
 @router.get("/{session_id}", response_model=SessionOut)
 async def get_session(session_id: UUID, db: AsyncSession = Depends(get_db)):
-    session = await db.get(Session, session_id)
+    from sqlalchemy.orm import joinedload
+    result = await db.execute(
+        select(Session).where(Session.id == session_id).options(joinedload(Session.master_video))
+    )
+    session = result.scalars().unique().first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session
+    
+    # Manually construct response to include master_url from the relationship
+    response_data = {
+        "id": session.id,
+        "name": session.name,
+        "camera_count": session.camera_count,
+        "status": session.status,
+        "sync_strategy": session.sync_strategy,
+        "layout": session.layout,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "master_url": session.master_video.url if session.master_video else None,
+    }
+    return SessionOut(**response_data)
 
 
 @router.get("/{session_id}/offsets", response_model=list[OffsetOut])

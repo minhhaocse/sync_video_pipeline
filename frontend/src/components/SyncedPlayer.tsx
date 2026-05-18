@@ -101,8 +101,8 @@ export default function SyncedPlayer({ url, title, onEnded }: SyncedPlayerProps)
             <span style={{ fontSize: 24, opacity: 0.5 }}>💤</span>
           </div>
           <div style={{ textAlign: "center" }}>
-            <p style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>Awaiting Video Feed</p>
-            <p style={{ fontSize: 13 }}>First synced chunk will appear here natively.</p>
+            <p style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>Awaiting Final Sync</p>
+            <p style={{ fontSize: 13 }}>The final master sync output will appear here when ready.</p>
           </div>
         </div>
       )}
