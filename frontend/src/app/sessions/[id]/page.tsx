@@ -50,6 +50,10 @@ export default function SessionDetailPage() {
           latestStage = "master_error";
           latestMessage = ev.message || "Full sync failed.";
           break;
+        case "sync_warning":
+          latestStage = "computing_offsets";
+          latestMessage = ev.message || "Sync warning: zero offsets were produced.";
+          break;
         case "master_done":
           latestStage = "master_done";
           latestMessage = ev.message || "Master video is ready.";
@@ -89,6 +93,8 @@ export default function SessionDetailPage() {
 
     if (lastEvent.type === "master_error") {
       addToast({ type: "error", title: "Sync Error", message: lastEvent.message || "Pipeline encountered an error." });
+    } else if (lastEvent.type === "sync_warning") {
+      addToast({ type: "warning", title: "Sync Warning", message: lastEvent.message || "Sync produced zero offsets." });
     } else if (lastEvent.type === "master_done") {
       addToast({ type: "success", title: "Sync Completed", message: "Final master video is ready." });
     } else if (lastEvent.type === "master_started") {
@@ -272,7 +278,7 @@ export default function SessionDetailPage() {
                 {events.slice().reverse().map((ev, i) => {
                   let accent = "var(--border)";
                   if (ev.type === "master_done" || ev.type === "chunk_done") accent = "var(--accent-green)";
-                  if (ev.type === "master_error" || ev.type === "error") accent = "var(--accent-red)";
+                  if (ev.type === "master_error" || ev.type === "error" || ev.type === "sync_warning") accent = "var(--accent-red)";
                   if (ev.type === "master_started" || ev.type === "processing_started" || ev.type === "concatenating" || ev.type === "computing_offsets" || ev.type === "aligning") accent = "var(--accent-amber)";
                   if (ev.type === "chunk_uploaded") accent = "var(--accent-blue)";
                   if (ev.type === "processing_started") accent = "var(--accent-amber)";
