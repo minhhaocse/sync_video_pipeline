@@ -22,26 +22,7 @@ export default function SessionsPage() {
   });
   const { addToast } = useToast();
 
-  const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [newName, setNewName] = useState("");
-  const [camCount, setCamCount] = useState(3);
-  const [syncStrategy, setSyncStrategy] = useState("auto");
-
-  const handleCreate = async () => {
-    if (!newName.trim()) return;
-    setCreating(true);
-    try {
-      await api.sessions.create(newName.trim(), camCount, syncStrategy);
-      setNewName("");
-      mutate();
-      addToast({ type: "success", title: "Session Created", message: `Successfully created "${newName.trim()}"` });
-    } catch (err: any) {
-      addToast({ type: "error", title: "Creation Failed", message: err.message || "An error occurred" });
-    } finally {
-      setCreating(false);
-    }
-  };
 
   const handleDelete = async (id: string, name: string) => {
     if (!confirm(`Are you sure you want to delete session "${name}"? This cannot be undone.`)) return;
@@ -66,62 +47,11 @@ export default function SessionsPage() {
         <div className="page-header fade-in-up">
           <h1 className="page-title">Recording Sessions</h1>
           <p className="page-subtitle">
-            Create new multi-camera sessions, monitor chunk uplads, and view synchronized outputs across all capture nodes.
+            View and manage recorded sessions, monitor sync progress, and inspect final synced outputs.
           </p>
         </div>
 
-        {/* Create Session */}
-        <div className="card fade-in-up stagger-1" style={{ marginBottom: 40, borderTop: "2px solid var(--accent-blue)" }}>
-          <h2 className="card-title" style={{ marginBottom: 20, display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 20 }}>✨</span> New Session
-          </h2>
-          <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-end" }}>
-            <div style={{ flex: 2, minWidth: 240 }}>
-              <label className="label">Session Name</label>
-              <input
-                className="input"
-                placeholder="e.g. Graduation Ceremony 2026"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleCreate()}
-                disabled={creating}
-              />
-            </div>
-            <div style={{ width: 140 }}>
-              <label className="label">Camera Count</label>
-              <input
-                className="input"
-                type="number"
-                min={1}
-                max={10}
-                value={camCount}
-                onChange={(e) => setCamCount(Number(e.target.value))}
-                disabled={creating}
-              />
-            </div>
-            <div style={{ width: 180 }}>
-              <label className="label">Sync Strategy</label>
-              <select
-                className="input"
-                value={syncStrategy}
-                onChange={(e) => setSyncStrategy(e.target.value)}
-                disabled={creating}
-              >
-                <option value="auto">Auto</option>
-                <option value="multividsynch">MultiVidSynch</option>
-                <option value="sesyn_net">SeSyn-Net</option>
-              </select>
-            </div>
-            <button
-              className="btn btn-primary"
-              onClick={handleCreate}
-              disabled={creating || !newName.trim()}
-              style={{ minWidth: 160 }}
-            >
-              {creating ? "Creating..." : "Create Session"}
-            </button>
-          </div>
-        </div>
+        {/* Sessions List */}
 
         {/* Sessions List */}
         {isLoading && (

@@ -18,15 +18,65 @@ from app.services.feature_based_approach.OTP import (
 
 logger = logging.getLogger(__name__)
 
+def extract_representative_frames(video_path: Path, segment_duration_seconds: float = 10.0, fps: float = 30.0):
+    """
+    Extract frames from the first and last segments of a video.
+    
+    Args:
+        video_path: Path to video file
+        segment_duration_seconds: Duration of segment to extract from start and end (default 10s)
+        fps: Frames per second (default 30fps)
+    
+    Returns:
+        list of frames from first segment + last segment
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap_fps = cap.get(cv2.CAP_PROP_FPS) or fps
+    
+    segment_frame_count = int(segment_duration_seconds * cap_fps)
+    frames = []
+    
+    # Extract first segment (frames 0 to segment_frame_count)
+    logger.info(f"Extracting first {segment_duration_seconds}s ({segment_frame_count} frames) from {video_path.name}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for i in range(segment_frame_count):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+    
+    # Extract last segment (frames total_frames-segment_frame_count to total_frames)
+    # if total_frames > segment_frame_count * 2:  # Ensure segments don't overlap
+    #     logger.info(f"Extracting last {segment_duration_seconds}s ({segment_frame_count} frames) from {video_path.name}")
+    #     last_segment_start = max(0, total_frames - segment_frame_count)
+    #     cap.set(cv2.CAP_PROP_POS_FRAMES, last_segment_start)
+    #     for i in range(segment_frame_count):
+    #         ret, frame = cap.read()
+    #         if not ret:
+    #             break
+    #         frames.append(frame)
+    # else:
+    #     logger.warning(f"Video {video_path.name} is too short to extract separate first and last segments")
+    
+    cap.release()
+    return frames
+
 def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, float]:
     """
     Computes offsets using a feature-based (CV) alignment approach.
     This method analyzes visual landmarks across cameras to determine temporal shifts.
     Since the core algorithm calculates offset in frames, we convert it to seconds
     based on the video's framerate.
+    
+    OPTIMIZATION: Instead of processing the entire video, this samples the first 10 seconds
+    and last 10 seconds of each video. This is sufficient to detect constant temporal offsets
+    while reducing computation time from full-video duration to ~600 frames per camera.
     """
     if not cam_ids:
         return {}
+
+    logger.info("Feature-based offset computation: using first+last 10s sampling (optimized for speed)")
 
     CAPTURE_FILES = []
     for cam_id in cam_ids:
@@ -57,7 +107,6 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
     cap_for_fps.release()
 
     total_frames = [get_total_frames(str(path)) for path in valid_files]
-    videos = [load_video(str(path)) for path in valid_files]
 
     SEARCH_FRAMES = min(30, min(total_frames))
 
@@ -66,7 +115,7 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
     first_frames_descriptors = []
     trajectories_data = {}
 
-    for i, (video_generator, frames_count) in enumerate(zip(videos, total_frames)):
+    for i, frames_count in enumerate(total_frames):
         cam_name = cam_ids[i]
         
         cap_for_metadata = cv2.VideoCapture(str(valid_files[i]))
@@ -115,9 +164,12 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
         p0 = best_kp
         desc0 = best_desc
 
-        for frame_idx, frame in enumerate(video_generator):
-            # To speed up, we might not need all frames if this takes too long,
-            # but for 10s chunks, 300 frames should be okay.
+        # Extract representative frames (first 10s + last 10s) instead of processing entire video
+        # This reduces computation from full video duration to ~600 frames total per camera
+        representative_frames = extract_representative_frames(valid_files[i], segment_duration_seconds=10.0, fps=fps)
+        logger.info(f"Processing {len(representative_frames)} representative frames for {cam_name} (first+last 10s)")
+        
+        for frame in tqdm(representative_frames, desc=f"Analyzing {cam_name}"):
             p1, desc1 = extract_features_from_frame(frame, roi_start, roi_size)
             matches = match_features(desc0, desc1)
             

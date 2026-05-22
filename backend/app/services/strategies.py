@@ -20,7 +20,11 @@ class FeatureSyncStrategy:
             from app.services.feature_based_approach.wrapper import compute_feature_offsets
             return compute_feature_offsets(chunk_dir, cam_ids)
         except Exception as e:
-            logger.warning(f"Feature Sync failed: {e}. Falling back to zero offsets.")
+            logger.error(
+                "Feature Sync failed. Falling back to zero offsets. "
+                "Check the feature-based sync pipeline and source videos.",
+                exc_info=True,
+            )
             return {cam_id: 0.0 for cam_id in cam_ids}
 
 class SeSynNetSyncStrategy:
@@ -30,7 +34,11 @@ class SeSynNetSyncStrategy:
             from app.services.sesyn_net_approach.wrapper import compute_sesyn_offsets
             return compute_sesyn_offsets(chunk_dir, cam_ids)
         except Exception as e:
-            logger.warning(f"SeSyn-Net Sync failed: {e}. Falling back to zero offsets.")
+            logger.error(
+                "SeSyn-Net Sync failed. Falling back to zero offsets. "
+                "Ensure the SeSyn-Net repository, model weights, and video inputs are available.",
+                exc_info=True,
+            )
             return {cam_id: 0.0 for cam_id in cam_ids}
 
 class AutoSyncStrategy:
@@ -43,7 +51,10 @@ class AutoSyncStrategy:
             from app.services.feature_based_approach.wrapper import compute_feature_offsets
             return compute_feature_offsets(chunk_dir, cam_ids)
         except Exception as e:
-            logger.warning(f"AutoSync: Feature-based sync failed: {e}")
+            logger.warning(
+                "AutoSync: Feature-based sync failed. Trying SeSyn-Net next.",
+                exc_info=True,
+            )
 
         # 2. Try SeSyn-Net Pose-Based (Slower but robust for human activity)
         try:
@@ -51,9 +62,12 @@ class AutoSyncStrategy:
             from app.services.sesyn_net_approach.wrapper import compute_sesyn_offsets
             return compute_sesyn_offsets(chunk_dir, cam_ids)
         except Exception as e:
-            logger.warning(f"AutoSync: SeSyn-Net sync failed: {e}")
+            logger.error(
+                "AutoSync: SeSyn-Net sync failed. Falling back to zero offsets for all cameras.",
+                exc_info=True,
+            )
             
-        logger.warning("All synchronization strategies failed. Falling back to zero offsets for all cameras.")
+        logger.error("AutoSync: All synchronization strategies failed. Falling back to zero offsets for all cameras.")
         return {cam_id: 0.0 for cam_id in cam_ids}
 
 def get_sync_strategy(name: str) -> SyncStrategy:

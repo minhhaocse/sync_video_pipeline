@@ -5,6 +5,7 @@ export interface Session {
   name: string;
   camera_count: number;
   status: "recording" | "processing" | "completed" | "failed";
+  master_url?: string | null;
   sync_strategy: string;
   created_at: string;
   updated_at: string;

@@ -184,7 +184,10 @@ def produce_master_video(
                     mv.status = "failed"
                     mv.error = error_msg
                     mv.finished_at = datetime.now(timezone.utc)
-                    db.commit()
+                session = db.query(Session).filter_by(id=uuid.UUID(session_id)).first()
+                if session:
+                    session.status = "failed"
+                db.commit()
         except Exception as db_err:
             logger.warning(f"[Master] Could not update DB status to failed: {db_err}")
 
@@ -248,6 +251,7 @@ def process_full_session(
 
         # -- Mark as completed in DB --
         try:
+            from app.models import MasterVideo, Session
             with SyncSessionLocal() as db:
                 mv = db.query(MasterVideo).filter_by(session_id=uuid.UUID(session_id)).first()
                 if mv:
@@ -255,7 +259,10 @@ def process_full_session(
                     mv.file_path = str(output_path)
                     mv.url = relative_url
                     mv.finished_at = datetime.now(timezone.utc)
-                    db.commit()
+                session = db.query(Session).filter_by(id=uuid.UUID(session_id)).first()
+                if session:
+                    session.status = "completed"
+                db.commit()
         except Exception as db_err:
             logger.warning(f"[Full Task] Could not update DB status to completed: {db_err}")
 
