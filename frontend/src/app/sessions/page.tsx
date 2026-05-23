@@ -16,6 +16,25 @@ const STATUS_LABELS: Record<string, string> = {
   failed:     "failed",
 };
 
+function formatSyncStrategy(strategy: string) {
+  switch (strategy) {
+    case "auto":
+      return "Auto Coarse-to-Fine";
+    case "multisyncvideo":
+    case "multividsync":
+    case "multividsynch":
+      return "MultiSyncVideo";
+    case "visual_hybrid":
+      return "Hybrid Visual";
+    case "sesyn_net":
+      return "SeSyn-Net";
+    case "feature_based":
+      return "MultiVidSynch";
+    default:
+      return strategy;
+  }
+}
+
 export default function SessionsPage() {
   const { data: sessions, error, isLoading, mutate } = useSWR("sessions", fetcher, {
     refreshInterval: 5000,
@@ -98,10 +117,10 @@ export default function SessionsPage() {
                 <div style={{ display: "flex", gap: 24, color: "var(--text-secondary)", fontSize: 14, marginBottom: 24 }}>
                   <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ color: "var(--accent-fuchsia)" }}>📱</span> {session.camera_count} Cameras
-                  </span>
-                  <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ color: "var(--accent-blue)" }}>⚙️</span> {session.sync_strategy === "sesyn_net" ? "SeSyn-Net" : session.sync_strategy === "auto" ? "Auto Sync" : "MultiVidSynch"}
-                  </span>
+	                  </span>
+	                  <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+	                    <span style={{ color: "var(--accent-blue)" }}>⚙️</span> {formatSyncStrategy(session.sync_strategy)}
+	                  </span>
                   <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ color: "var(--accent-blue)" }}>🕒</span>
                     {new Date(session.created_at).toLocaleDateString("en-US", {

@@ -36,7 +36,8 @@ def compute_offsets(chunk_dir: Path, cam_ids: list[str], reference_cam: str = No
         reference_cam: the reference camera (default: first in list)
 
     Returns:
-        dict mapping cam_id -> offset_seconds (positive = this cam is LATE)
+        dict mapping cam_id -> offset_seconds.
+        Positive values mean trim this camera; negative values mean pad/delay it.
 
     Raises:
         FileNotFoundError: if a video file is missing
@@ -100,7 +101,10 @@ def compute_offsets(chunk_dir: Path, cam_ids: list[str], reference_cam: str = No
             # Cross-correlate
             correlation = correlate(ref_audio, cam_audio, mode="full")
             lag_samples = int(correlation.argmax()) - (len(cam_audio) - 1)
-            offset_seconds = lag_samples / sample_rate
+            # scipy's lag is positive when cam_audio must shift right to match
+            # ref_audio. align_chunk uses the opposite convention: positive
+            # offsets trim leading material from the camera file.
+            offset_seconds = -lag_samples / sample_rate
 
             offsets[cam_id] = float(offset_seconds)
             logger.info(f"Offset {cam_id} vs {reference_cam}: {offset_seconds:.4f}s")

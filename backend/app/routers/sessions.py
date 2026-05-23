@@ -128,6 +128,24 @@ async def get_offsets(session_id: UUID, db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
+@router.get("/{session_id}/sync-report")
+async def get_sync_report(session_id: UUID):
+    import json
+    from pathlib import Path
+    from app.config import get_settings
+
+    settings = get_settings()
+    report_path = Path(settings.storage_base) / "raw" / str(session_id) / "sync_report.json"
+    if not report_path.exists():
+        return None
+
+    try:
+        return json.loads(report_path.read_text())
+    except json.JSONDecodeError as exc:
+        logger.warning(f"Invalid sync report for session {session_id}: {exc}")
+        raise HTTPException(status_code=500, detail="Sync report is invalid JSON")
+
+
 @router.get("/{session_id}/chunks")
 async def get_chunks(session_id: UUID):
     from pathlib import Path

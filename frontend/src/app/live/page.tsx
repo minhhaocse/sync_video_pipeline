@@ -252,8 +252,8 @@ export default function LivePage() {
                 cursor: isFinalizing ? "not-allowed" : "pointer"
               }}
             >
-              <option value="auto">Auto (Smart)</option>
-              <option value="multividsynch">MultiVidSynch (Classic)</option>
+              <option value="auto">Auto (MultiSyncVideo, then SeSyn-Net)</option>
+              <option value="multividsynch">MultiSyncVideo (Audio / Global)</option>
               <option value="sesyn_net">SeSyn-Net (AI)</option>
             </select>
           </div>

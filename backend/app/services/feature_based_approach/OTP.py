@@ -41,6 +41,11 @@ def detect_features(frame):
 
 
 def match_features(descriptors1, descriptors2):
+    if descriptors1 is None or descriptors2 is None:
+        return []
+    if len(descriptors1) < 2 or len(descriptors2) < 2:
+        return []
+
     # Define FLANN parameters for ORB
     FLANN_INDEX_LSH = 6
     index_params = dict(algorithm = FLANN_INDEX_LSH,
@@ -53,7 +58,10 @@ def match_features(descriptors1, descriptors2):
     flann = cv2.FlannBasedMatcher(index_params, search_params)
 
     # Match descriptors
-    raw_matches = flann.knnMatch(np.asarray(descriptors1, np.uint8), np.asarray(descriptors2, np.uint8), k=2)
+    try:
+        raw_matches = flann.knnMatch(np.asarray(descriptors1, np.uint8), np.asarray(descriptors2, np.uint8), k=2)
+    except cv2.error:
+        return []
 
     # Apply ratio test
     good_matches = []
@@ -352,16 +360,28 @@ def compute_fundamental_matrix(p1, desc1, p2, desc2):
     # Print the number of matches
     print(f"Number of matches for initial fundamental matrix: {len(matches)}")
 
+    if len(matches) < 8:
+        print("Error: Could not compute fundamental matrix due to insufficient matches.")
+        return None, matches, p1, p2
+
     # Get the coordinates of the matched keypoints
     points1 = np.float32([p1[m.queryIdx].pt for m in matches])
     points2 = np.float32([p2[m.trainIdx].pt for m in matches])
+
+    if points1.ndim != 2 or points2.ndim != 2 or points1.shape[1] != 2 or points2.shape[1] != 2:
+        print("Error: Could not compute fundamental matrix due to invalid point shapes.")
+        return None, matches, p1, p2
 
     # Print the coordinates of the points
     print("Points1:", points1)
     print("Points2:", points2)
 
     # Compute the fundamental matrix
-    F, mask = cv2.findFundamentalMat(points1, points2, cv2.FM_RANSAC)
+    try:
+        F, mask = cv2.findFundamentalMat(points1, points2, cv2.FM_RANSAC)
+    except cv2.error as exc:
+        print(f"Error: Could not compute fundamental matrix: {exc}")
+        return None, matches, p1, p2
 
     # Check if F is None
     if F is None:

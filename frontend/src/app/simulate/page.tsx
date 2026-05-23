@@ -159,8 +159,8 @@ export default function SimulatePage() {
                   onChange={(e) => setSyncStrategy(e.target.value)}
                   style={{ padding: 12, borderRadius: 8, border: "1px solid #444", background: "#1a1a1a", color: "white" }}
                 >
-                  <option value="auto">Auto (Best Match)</option>
-                  <option value="multividsynch">MultiVidSynch (Feature-based)</option>
+                  <option value="auto">Auto (MultiSyncVideo, then SeSyn-Net)</option>
+                  <option value="multividsynch">MultiSyncVideo (Audio / Global)</option>
                   <option value="sesyn_net">SeSyn-Net (Deep Learning)</option>
                 </select>
               </div>

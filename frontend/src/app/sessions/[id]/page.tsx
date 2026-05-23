@@ -4,13 +4,51 @@ import { useEffect, useState } from "react";
 import useSWR from "swr";
 import { useParams, useRouter } from "next/navigation";
 import Navbar from "@/components/Navbar";
-import { api, Session, Offset } from "@/lib/api";
+import { api } from "@/lib/api";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import SyncedPlayer from "@/components/SyncedPlayer";
 import { useToast } from "@/components/Toast";
 
 const fetcher = (id: string) => api.sessions.get(id);
-const offsetFetcher = (id: string) => api.sessions.offsets(id);
+const syncReportFetcher = (id: string) => api.sessions.syncReport(id);
+
+function formatSyncMethod(method?: string | null) {
+  switch (method) {
+    case "audio":
+      return "Audio Cross-Correlation";
+    case "feature_based":
+    case "feature":
+      return "MultiVidSynch";
+    case "multividsynch":
+    case "multividsync":
+    case "multisyncvideo":
+      return "MultiSyncVideo";
+    case "visual_hybrid":
+    case "hybrid":
+      return "Hybrid Visual";
+    case "visual_consensus":
+      return "Hybrid Visual Consensus";
+    case "auto_coarse_to_fine":
+      return "Auto Coarse-to-Fine";
+    case "sesyn_net":
+    case "sesyn":
+      return "SeSyn-Net";
+    case "auto":
+      return "Auto";
+    default:
+      return method || "Pending";
+  }
+}
+
+function formatSeconds(value?: number) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "n/a";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(3)}s`;
+}
+
+function formatScore(value?: number | null) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "n/a";
+  return value.toFixed(4);
+}
 
 export default function SessionDetailPage() {
   const params = useParams();
@@ -19,7 +57,7 @@ export default function SessionDetailPage() {
   const { addToast } = useToast();
 
   const { data: session, error, isLoading, mutate } = useSWR(id ? `session-${id}` : null, () => fetcher(id));
-  const { data: offsets } = useSWR(id ? `offsets-${id}` : null, () => offsetFetcher(id));
+  const { data: syncReport, mutate: mutateSyncReport } = useSWR(id ? `sync-report-${id}` : null, () => syncReportFetcher(id));
   const { events, connected } = useWebSocket(id);
 
   const [currentVideoUrl, setCurrentVideoUrl] = useState<string | null>(null);
@@ -94,13 +132,15 @@ export default function SessionDetailPage() {
     if (lastEvent.type === "master_error") {
       addToast({ type: "error", title: "Sync Error", message: lastEvent.message || "Pipeline encountered an error." });
     } else if (lastEvent.type === "sync_warning") {
-      addToast({ type: "warning", title: "Sync Warning", message: lastEvent.message || "Sync produced zero offsets." });
+      addToast({ type: "info", title: "Sync Warning", message: lastEvent.message || "Sync produced zero offsets." });
     } else if (lastEvent.type === "master_done") {
       addToast({ type: "success", title: "Sync Completed", message: "Final master video is ready." });
+      mutateSyncReport();
+      mutate();
     } else if (lastEvent.type === "master_started") {
       addToast({ type: "info", title: "Sync Started", message: "Final master sync has started." });
     }
-  }, [events, currentVideoUrl, addToast]);
+  }, [events, currentVideoUrl, addToast, mutateSyncReport, mutate]);
 
   useEffect(() => {
     if (session?.master_url && !currentVideoUrl) {
@@ -269,6 +309,145 @@ export default function SessionDetailPage() {
 
           {/* Right Column: Metadata & Offsets */}
           <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+            <div className="card">
+              <div className="card-header" style={{ marginBottom: 12, borderBottom: "1px solid var(--border)", paddingBottom: 16 }}>
+                <h3 className="card-title">Sync Method</h3>
+              </div>
+              <div style={{ display: "grid", gap: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+                  <span style={{ color: "var(--text-secondary)", fontSize: 13 }}>Requested</span>
+                  <span className="mono" style={{ color: "var(--text-primary)", fontSize: 13, textAlign: "right" }}>
+                    {formatSyncMethod(syncReport?.requested_strategy || session.sync_strategy)}
+                  </span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+                  <span style={{ color: "var(--text-secondary)", fontSize: 13 }}>Actually used</span>
+                  <span className="mono" style={{ color: "var(--accent-cyan)", fontSize: 13, textAlign: "right", fontWeight: 700 }}>
+                    {formatSyncMethod(syncReport?.selected_method)}
+                  </span>
+                </div>
+                {syncReport?.input_mode && (
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+                    <span style={{ color: "var(--text-secondary)", fontSize: 13 }}>Input type</span>
+                    <span className="mono" style={{ color: "var(--text-primary)", fontSize: 13, textAlign: "right" }}>
+                      {syncReport.input_mode === "chunks" ? "Recorded chunks" : "Uploaded videos"}
+                    </span>
+                  </div>
+                )}
+                {syncReport?.anchor_video && (
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 16 }}>
+                    <span style={{ color: "var(--text-secondary)", fontSize: 13 }}>Anchor</span>
+                    <span className="mono" style={{ color: "var(--text-primary)", fontSize: 13, textAlign: "right" }}>
+                      {syncReport.anchor_video}
+                    </span>
+                  </div>
+                )}
+                {syncReport?.strategy_details?.selection_reason && (
+                  <div style={{ padding: 12, borderRadius: "var(--radius-sm)", background: "rgba(6, 182, 212, 0.08)", border: "1px solid rgba(6, 182, 212, 0.25)", fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                    {syncReport.strategy_details.selection_confidence && (
+                      <div className="mono" style={{ color: syncReport.strategy_details.selection_confidence === "low" ? "var(--accent-amber)" : "var(--accent-cyan)", fontWeight: 700, marginBottom: 4 }}>
+                        Confidence: {syncReport.strategy_details.selection_confidence}
+                      </div>
+                    )}
+                    {syncReport.strategy_details.selection_reason}
+                  </div>
+                )}
+                {syncReport?.strategy_details?.pipeline_stages && syncReport.strategy_details.pipeline_stages.length > 0 && (
+                  <div style={{ display: "grid", gap: 8, paddingTop: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" }}>Pipeline stages</div>
+                    {syncReport.strategy_details.pipeline_stages.map((stage, index) => (
+                      <div key={`${stage}-${index}`} className="mono" style={{ fontSize: 12, color: "var(--text-primary)" }}>
+                        {index + 1}. {stage}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {syncReport?.strategy_details?.coarse_offsets && Object.keys(syncReport.strategy_details.coarse_offsets).length > 0 && (
+                  <div style={{ display: "grid", gap: 8, paddingTop: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" }}>Coarse offsets</div>
+                    {Object.entries(syncReport.strategy_details.coarse_offsets).map(([camId, offset]) => (
+                      <div key={`coarse-${camId}`} style={{ display: "flex", justifyContent: "space-between", gap: 16, fontSize: 12 }}>
+                        <span className="mono" style={{ color: "var(--text-muted)" }}>{camId}</span>
+                        <span className="mono" style={{ color: "var(--text-primary)" }}>{formatSeconds(offset)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {syncReport?.strategy_details?.fine_residual_offsets && Object.keys(syncReport.strategy_details.fine_residual_offsets).length > 0 && (
+                  <div style={{ display: "grid", gap: 8, paddingTop: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" }}>SeSyn fine residual</div>
+                    {Object.entries(syncReport.strategy_details.fine_residual_offsets).map(([camId, offset]) => (
+                      <div key={`fine-${camId}`} style={{ display: "flex", justifyContent: "space-between", gap: 16, fontSize: 12 }}>
+                        <span className="mono" style={{ color: "var(--text-muted)" }}>{camId}</span>
+                        <span className="mono" style={{ color: "var(--text-primary)" }}>{formatSeconds(offset)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {syncReport?.strategy_details?.candidates && Object.keys(syncReport.strategy_details.candidates).length > 0 && (
+                  <div style={{ display: "grid", gap: 10, paddingTop: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" }}>Method candidates</div>
+                    {Object.entries(syncReport.strategy_details.candidates).map(([method, candidate]) => (
+                      <div key={method} style={{ display: "grid", gap: 6, padding: 10, borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", background: "rgba(255,255,255,0.02)" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12 }}>
+                          <span className="mono" style={{ color: "var(--text-primary)", fontWeight: 700 }}>{formatSyncMethod(method)}</span>
+                          <span className="mono" style={{ color: "var(--text-muted)" }}>
+                            score {formatScore(syncReport.strategy_details?.candidate_scores?.[method])}
+                          </span>
+                        </div>
+                        {Object.entries(candidate).map(([camId, offset]) => (
+                          <div key={`${method}-${camId}`} style={{ display: "flex", justifyContent: "space-between", gap: 12, fontSize: 12 }}>
+                            <span className="mono" style={{ color: "var(--text-muted)" }}>{camId}</span>
+                            <span className="mono" style={{ color: "var(--text-primary)" }}>{formatSeconds(offset)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                    {typeof syncReport.strategy_details.max_disagreement_seconds === "number" && (
+                      <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                        Max disagreement: {formatSeconds(syncReport.strategy_details.max_disagreement_seconds)}
+                      </div>
+                    )}
+                    {typeof syncReport.strategy_details.score_margin === "number" && (
+                      <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                        Score margin: {formatScore(syncReport.strategy_details.score_margin)}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {syncReport?.duration_hints && Object.keys(syncReport.duration_hints).length > 0 && (
+                  <div style={{ padding: 12, borderRadius: "var(--radius-sm)", background: "rgba(245, 158, 11, 0.08)", border: "1px solid rgba(245, 158, 11, 0.25)" }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent-amber)", marginBottom: 8 }}>Duration correction applied</div>
+                    {Object.entries(syncReport.duration_hints).map(([camId, hint]) => (
+                      <div key={camId} style={{ display: "grid", gap: 4, fontSize: 12, color: "var(--text-secondary)" }}>
+                        <div className="mono" style={{ color: "var(--text-primary)" }}>{camId}</div>
+                        <div>Raw: {formatSeconds(hint.original_offset)} → Final: {formatSeconds(hint.adjusted_offset)}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {syncReport?.final_offsets && Object.keys(syncReport.final_offsets).length > 0 && (
+                  <div style={{ display: "grid", gap: 8, paddingTop: 4 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" }}>Final offsets</div>
+                    {Object.entries(syncReport.final_offsets).map(([camId, offset]) => (
+                      <div key={camId} style={{ display: "flex", justifyContent: "space-between", gap: 16, fontSize: 12 }}>
+                        <span className="mono" style={{ color: "var(--text-muted)" }}>{camId}</span>
+                        <span className="mono" style={{ color: "var(--text-primary)" }}>
+                          {formatSeconds(offset)}
+                          {typeof syncReport.frame_offsets?.[camId] === "number" ? ` (${syncReport.frame_offsets[camId]}f)` : ""}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!syncReport && (
+                  <div style={{ fontSize: 13, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                    Method details will appear after the next full sync finishes.
+                  </div>
+                )}
+              </div>
+            </div>
+
             {/* Event Feed */}
             <div className="card" style={{ flexGrow: 1, display: "flex", flexDirection: "column" }}>
               <div className="card-header" style={{ marginBottom: 12, borderBottom: "1px solid var(--border)", paddingBottom: 16 }}>

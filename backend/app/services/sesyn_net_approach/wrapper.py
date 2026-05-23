@@ -9,10 +9,50 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+MIN_HUMAN_FRAME_RATIO = 0.15
+MIN_KEYPOINT_CONFIDENCE = 0.20
+POSE_MOTION_MAX_OFFSET_SECONDS = 9.0
+POSE_MOTION_MIN_OVERLAP_SECONDS = 1.5
+POSE_MOTION_MIN_CORRELATION = 0.30
+POSE_MOTION_OVERRIDE_DISAGREEMENT_SECONDS = 1.0
+
 # Module-level cache so the YOLO and GCN models are only loaded once per process
 _sesyn_dir_cache: Path | None = None
 _gcn_model_cache = None
 _pose_model_cache = None
+LAST_SYNC_DETAILS: dict = {}
+
+
+def _patch_cuda_noops_for_cpu(torch_module) -> None:
+    """
+    The upstream SeSyn-Net files call .cuda() directly in a few places. In this
+    app we support CPU-only Docker images, so make those calls harmless when
+    CUDA is unavailable instead of failing before inference can run.
+    """
+    cuda_compiled = bool(getattr(torch_module.backends, "cuda", None) and torch_module.backends.cuda.is_built())
+    if cuda_compiled and torch_module.cuda.is_available():
+        return
+    if getattr(torch_module, "_videosync_cuda_noop_patch", False):
+        return
+
+    def tensor_cuda(self, device=None, non_blocking=False, memory_format=None):
+        return self
+
+    def module_cuda(self, device=None):
+        return self
+
+    torch_module.Tensor.cuda = tensor_cuda
+    torch_module.nn.Module.cuda = module_cuda
+    torch_module._videosync_cuda_noop_patch = True
+    logger.info("Applied CPU compatibility patch for SeSyn-Net CUDA calls.")
+
+
+def _select_torch_device(torch_module):
+    cuda_compiled = bool(getattr(torch_module.backends, "cuda", None) and torch_module.backends.cuda.is_built())
+    if cuda_compiled and torch_module.cuda.is_available():
+        return torch_module.device("cuda")
+    _patch_cuda_noops_for_cpu(torch_module)
+    return torch_module.device("cpu")
 
 
 def setup_sesyn_net() -> Path:
@@ -79,6 +119,7 @@ def _get_models(sesyn_dir: Path):
     global _gcn_model_cache, _pose_model_cache
     import torch
     from ultralytics import YOLO
+    device = _select_torch_device(torch)
 
     if _pose_model_cache is None:
         yolo_weights = sesyn_dir / "yolo11s-pose.pt"
@@ -102,7 +143,6 @@ def _get_models(sesyn_dir: Path):
                 f"{Path(__file__).resolve().parent}/model/cmu_syn.pth"
             )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Loading SeSyn-Net Adjusted_GCN model onto {device} (first use)...")
         checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
         gcn_model = Adjusted_GCN(
@@ -125,7 +165,8 @@ def extract_keypoints_for_video(video_path: Path, model) -> np.ndarray:
         np.ndarray of shape (3, 17, T, 1) — (xy+conf, joints, frames, persons)
     """
     import torch
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device_obj = _select_torch_device(torch)
+    device = "cuda:0" if device_obj.type == "cuda" else "cpu"
     results = model(str(video_path), stream=True, device=device, verbose=False)
 
     all_frames_data = []
@@ -145,6 +186,119 @@ def extract_keypoints_for_video(video_path: Path, model) -> np.ndarray:
     return data
 
 
+def _human_presence_ratio(pose_data: np.ndarray) -> float:
+    confidences = pose_data[2, :, :, 0]
+    if confidences.size == 0:
+        return 0.0
+    frame_has_human = np.max(confidences, axis=0) >= MIN_KEYPOINT_CONFIDENCE
+    return float(np.mean(frame_has_human))
+
+
+def _pose_motion_signal(pose_data: np.ndarray) -> np.ndarray:
+    """
+    Build a view-tolerant motion signal from detected skeletons.
+
+    SeSyn-Net's GCN matcher is good at comparing local pose windows, but the
+    upstream helper drops the sign and can under-estimate large start gaps.
+    This signal keeps the signed global search simple: compare how much the
+    body is moving over time, not where it is in the image.
+    """
+    xy = pose_data[:2, :, :, 0]
+    conf = pose_data[2, :, :, 0]
+    values: list[float] = []
+
+    for frame_idx in range(1, xy.shape[2]):
+        valid = (
+            (conf[:, frame_idx] >= MIN_KEYPOINT_CONFIDENCE)
+            & (conf[:, frame_idx - 1] >= MIN_KEYPOINT_CONFIDENCE)
+        )
+        if int(np.sum(valid)) < 4:
+            values.append(0.0)
+            continue
+
+        deltas = xy[:, valid, frame_idx] - xy[:, valid, frame_idx - 1]
+        values.append(float(np.median(np.linalg.norm(deltas, axis=0))))
+
+    signal = np.asarray(values, dtype=np.float64)
+    if signal.size < 3:
+        return signal
+
+    # A tiny smoothing pass reduces detector jitter without erasing gestures.
+    kernel = np.ones(3, dtype=np.float64) / 3.0
+    signal = np.convolve(signal, kernel, mode="same")
+    return signal
+
+
+def _zscore(values: np.ndarray) -> np.ndarray:
+    return (values - float(np.mean(values))) / (float(np.std(values)) + 1e-6)
+
+
+def _estimate_offsets_from_pose_motion(
+    cam_data: dict[str, np.ndarray],
+    fps_by_cam: dict[str, float],
+    cam_ids: list[str],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Estimate signed offsets by cross-correlating skeleton motion magnitude.
+
+    Positive offsets use the app convention: trim that camera because it
+    started earlier than the anchor.
+    """
+    ref_cam = cam_ids[0]
+    ref_fps = float(fps_by_cam.get(ref_cam, 30.0) or 30.0)
+    signals = {cam_id: _pose_motion_signal(cam_data[cam_id]) for cam_id in cam_ids}
+    ref_signal = signals[ref_cam]
+    if len(ref_signal) < int(POSE_MOTION_MIN_OVERLAP_SECONDS * ref_fps):
+        raise ValueError("Pose-motion sync needs a longer reference motion signal.")
+
+    offsets = {ref_cam: 0.0}
+    confidence = {ref_cam: 1.0}
+    max_lag = int(round(POSE_MOTION_MAX_OFFSET_SECONDS * ref_fps))
+    min_overlap = max(6, int(round(POSE_MOTION_MIN_OVERLAP_SECONDS * ref_fps)))
+
+    for cam_id in cam_ids[1:]:
+        cam_signal = signals[cam_id]
+        if len(cam_signal) < min_overlap:
+            raise ValueError(f"Pose-motion sync needs a longer motion signal for {cam_id}.")
+
+        best: tuple[float, float, int, int] | None = None
+        for lag in range(-max_lag, max_lag + 1):
+            ref_start = max(0, -lag)
+            cam_start = max(0, lag)
+            overlap = min(
+                len(ref_signal) - ref_start,
+                len(cam_signal) - cam_start,
+            )
+            if overlap < min_overlap:
+                continue
+
+            ref_window = _zscore(ref_signal[ref_start:ref_start + overlap])
+            cam_window = _zscore(cam_signal[cam_start:cam_start + overlap])
+            corr = float(np.mean(ref_window * cam_window))
+            score = float(np.mean(np.square(ref_window - cam_window)))
+            if best is None or score < best[0]:
+                best = (score, corr, lag, overlap)
+
+        if best is None:
+            raise ValueError(f"Pose-motion sync could not compare {cam_id}.")
+
+        score, corr, lag, overlap = best
+        if corr < POSE_MOTION_MIN_CORRELATION:
+            raise ValueError(
+                f"Pose-motion sync confidence for {cam_id} was too low "
+                f"(corr={corr:.3f}, score={score:.3f}, overlap={overlap} frames)."
+            )
+
+        offsets[cam_id] = float(lag / ref_fps)
+        confidence[cam_id] = corr
+        logger.info(
+            f"Pose-motion signed offset for {cam_id}: {offsets[cam_id]:.3f}s "
+            f"(lag={lag} frames, corr={corr:.3f}, overlap={overlap} frames)"
+        )
+
+    return offsets, confidence
+
+
 def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, float]:
     """
     Compute temporal offsets using the SeSyn-Net GCN pose-based approach.
@@ -157,6 +311,12 @@ def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, floa
         dict mapping cam_id -> offset_seconds (reference cam = 0.0)
     """
     import torch
+    global LAST_SYNC_DETAILS
+    LAST_SYNC_DETAILS = {
+        "internal_method": "sesyn_gcn",
+        "selection_reason": "",
+    }
+    _select_torch_device(torch)
 
     logger.info("Setting up SeSyn-Net environment...")
     sesyn_dir = setup_sesyn_net()
@@ -173,7 +333,7 @@ def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, floa
 
     # ── Extract keypoints for every camera ─────────────────────────────────────
     cam_data: dict[str, np.ndarray] = {}
-    fps_val = 30.0
+    fps_by_cam: dict[str, float] = {}
 
     for cid in cam_ids:
         # Find the video file (support multiple extensions)
@@ -188,17 +348,27 @@ def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, floa
         video_path = video_files[0]
 
         cap = cv2.VideoCapture(str(video_path))
-        fps_val = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps_by_cam[cid] = cap.get(cv2.CAP_PROP_FPS) or 30.0
         cap.release()
 
         logger.info(f"Extracting keypoints for camera {cid} ({video_path.name})...")
         cam_data[cid] = extract_keypoints_for_video(video_path, pose_model)
+        human_ratio = _human_presence_ratio(cam_data[cid])
+        logger.info(f"SeSyn-Net human presence ratio for {cid}: {human_ratio:.3f}")
+        if human_ratio < MIN_HUMAN_FRAME_RATIO:
+            raise ValueError(
+                f"SeSyn-Net could not detect reliable human pose in {cid} "
+                f"(human frame ratio={human_ratio:.3f}, required={MIN_HUMAN_FRAME_RATIO:.3f})."
+            )
 
     if len(cam_data) < 2:
         raise ValueError(
             f"SeSyn-Net requires at least 2 cameras with video files; "
             f"only found: {list(cam_data.keys())}"
         )
+    missing = [cid for cid in cam_ids if cid not in cam_data]
+    if missing:
+        raise ValueError(f"SeSyn-Net could not find videos for cameras: {missing}")
 
     # ── Sliding window GCN inference ────────────────────────────────────────────
     window_size = 120
@@ -254,7 +424,75 @@ def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, floa
     logger.info("Solving least-squares for global offsets...")
     opt_offsets = solve_least_squares_general(measurements, cam_ids)
 
-    # Convert frames -> seconds
-    final_offsets = {cid: float(frames / fps_val) for cid, frames in opt_offsets.items()}
+    ref_frames = float(opt_offsets.get(cam_ids[0], 0.0))
+    ref_fps = fps_by_cam.get(cam_ids[0], 30.0) or 30.0
+
+    # Convert frames -> seconds and normalize to the first camera.
+    final_offsets = {
+        cid: float((float(opt_offsets[cid]) - ref_frames) / (fps_by_cam.get(cid) or ref_fps))
+        for cid in cam_ids
+        if cid in opt_offsets
+    }
+    final_offsets[cam_ids[0]] = 0.0
+    gcn_offsets = dict(final_offsets)
+
+    try:
+        motion_offsets, motion_confidence = _estimate_offsets_from_pose_motion(
+            cam_data,
+            fps_by_cam,
+            cam_ids,
+        )
+        max_disagreement = max(
+            abs(float(final_offsets[cid]) - float(motion_offsets[cid]))
+            for cid in cam_ids
+        )
+        if max_disagreement > POSE_MOTION_OVERRIDE_DISAGREEMENT_SECONDS:
+            logger.warning(
+                "SeSyn-Net GCN offsets disagreed with signed pose-motion sync "
+                f"by {max_disagreement:.3f}s. Using signed pose-motion offsets. "
+                f"gcn={final_offsets}, pose_motion={motion_offsets}, "
+                f"confidence={motion_confidence}"
+            )
+            final_offsets = motion_offsets
+            LAST_SYNC_DETAILS = {
+                "internal_method": "signed_pose_motion",
+                "gcn_offsets": gcn_offsets,
+                "pose_motion_offsets": motion_offsets,
+                "pose_motion_confidence": motion_confidence,
+                "max_internal_disagreement_seconds": float(max_disagreement),
+                "selection_reason": (
+                    "The SeSyn-Net GCN local-window estimate disagreed with the signed "
+                    "skeleton-motion timeline search, so the signed pose-motion offset was used."
+                ),
+            }
+        else:
+            logger.info(
+                "SeSyn-Net GCN offsets agree with signed pose-motion validation "
+                f"(max disagreement={max_disagreement:.3f}s)."
+            )
+            LAST_SYNC_DETAILS = {
+                "internal_method": "sesyn_gcn",
+                "gcn_offsets": gcn_offsets,
+                "pose_motion_offsets": motion_offsets,
+                "pose_motion_confidence": motion_confidence,
+                "max_internal_disagreement_seconds": float(max_disagreement),
+                "selection_reason": (
+                    "The SeSyn-Net GCN estimate agreed with signed skeleton-motion validation."
+                ),
+            }
+    except Exception as exc:
+        logger.warning(
+            f"Signed pose-motion validation failed; keeping GCN offsets: {exc}",
+            exc_info=True,
+        )
+        LAST_SYNC_DETAILS = {
+            "internal_method": "sesyn_gcn",
+            "gcn_offsets": gcn_offsets,
+            "selection_reason": (
+                "Signed skeleton-motion validation failed, so the SeSyn-Net GCN estimate was kept."
+            ),
+            "validation_error": str(exc),
+        }
+
     logger.info(f"SeSyn-Net final offsets (seconds): {final_offsets}")
     return final_offsets

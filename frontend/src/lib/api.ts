@@ -17,6 +17,45 @@ export interface Offset {
   computed_at: string;
 }
 
+export interface SyncReport {
+  status?: string;
+  method?: string;
+  anchor_video?: string;
+  offsets?: Record<string, number>;
+  offset_units?: string;
+  frame_offsets?: Record<string, number>;
+  requested_strategy: string;
+  selected_method: string;
+  input_mode?: string;
+  raw_offsets: Record<string, number>;
+  final_offsets: Record<string, number>;
+  render_trim_offsets: Record<string, number>;
+  duration_hints: Record<string, {
+    reason: string;
+    original_offset: number;
+    duration_delta: number;
+    adjusted_offset: number;
+  }>;
+  strategy_details?: {
+    mode?: string;
+    pipeline_stages?: string[];
+    coarse_method?: string;
+    coarse_offsets?: Record<string, number>;
+    fine_method?: string;
+    fine_residual_offsets?: Record<string, number>;
+    max_fine_residual_seconds?: number;
+    selection_reason?: string;
+    selection_confidence?: string;
+    max_disagreement_seconds?: number;
+    agreement_tolerance_seconds?: number;
+    validation_score_min_margin?: number;
+    score_margin?: number;
+    candidates?: Record<string, Record<string, number>>;
+    candidate_scores?: Record<string, number | null>;
+  };
+  errors: string[];
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 // All paths are relative — Next.js rewrites forward them to the FastAPI backend.
 // This means the app works correctly both locally AND over Cloudflare tunnel
@@ -53,6 +92,8 @@ export const api = {
       apiFetch<void>(`/api/sessions/${id}`, { method: "DELETE" }),
 
     offsets: (id: string) => apiFetch<Offset[]>(`/api/sessions/${id}/offsets`),
+
+    syncReport: (id: string) => apiFetch<SyncReport | null>(`/api/sessions/${id}/sync-report`),
 
     chunks: (id: string) => apiFetch<number[]>(`/api/sessions/${id}/chunks`),
   },

@@ -3,6 +3,7 @@ Orchestrates the full sync pipeline for a single chunk set.
 Called by the Celery task after all cameras have uploaded.
 """
 import logging
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -95,7 +96,222 @@ def _remux_to_mp4(input_path: Path, output_path: Path) -> bool:
     return output_path.exists() and output_path.stat().st_size > 0
 
 
-def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str, Path]:
+def _probe_duration_seconds(path: Path) -> float | None:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"Could not probe duration for {path}: {result.stderr[-500:]}")
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        logger.warning(f"Could not parse duration for {path}: {result.stdout!r}")
+        return None
+
+
+def _probe_fps(path: Path) -> float | None:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        logger.warning(f"Could not probe FPS for {path}: {result.stderr[-500:]}")
+        return None
+    value = result.stdout.strip()
+    try:
+        if "/" in value:
+            numerator, denominator = value.split("/", 1)
+            denominator_float = float(denominator)
+            if denominator_float == 0:
+                return None
+            return float(numerator) / denominator_float
+        return float(value)
+    except ValueError:
+        logger.warning(f"Could not parse FPS for {path}: {value!r}")
+        return None
+
+
+def _apply_common_end_duration_hint(
+    offsets: dict[str, float],
+    source_paths: dict[str, Path],
+    ref_cam: str,
+) -> tuple[dict[str, float], dict[str, dict[str, float | str]]]:
+    """
+    Browser/session recordings often share a stop time but not a start time.
+    If visual sync returns an offset whose sign conflicts with the full-video
+    duration delta, prefer the duration delta so we trim the longer recording
+    instead of padding it with black.
+    """
+    ref_duration = _probe_duration_seconds(source_paths[ref_cam])
+    if ref_duration is None:
+        return offsets, {}
+
+    adjusted = dict(offsets)
+    hints: dict[str, dict[str, float | str]] = {}
+    for cam_id, current_offset in offsets.items():
+        if cam_id == ref_cam or cam_id not in source_paths:
+            continue
+
+        cam_duration = _probe_duration_seconds(source_paths[cam_id])
+        if cam_duration is None:
+            continue
+
+        duration_delta = cam_duration - ref_duration
+        signs_conflict = current_offset * duration_delta < 0
+        underestimates_common_end = (
+            abs(duration_delta) >= 3.0
+            and abs(current_offset - duration_delta) >= max(2.0, abs(duration_delta) * 0.5)
+        )
+        if signs_conflict:
+            reason = "sign_conflict"
+        elif underestimates_common_end:
+            reason = "common_end_duration_delta"
+        else:
+            reason = ""
+
+        if reason:
+            logger.warning(
+                f"Offset for {cam_id} needs duration hint ({reason}) "
+                f"(sync={current_offset:.3f}s, duration_delta={duration_delta:.3f}s). "
+                "Using duration-based common-end offset."
+            )
+            adjusted[cam_id] = float(duration_delta)
+            hints[cam_id] = {
+                "reason": reason,
+                "original_offset": float(current_offset),
+                "duration_delta": float(duration_delta),
+                "adjusted_offset": float(duration_delta),
+            }
+
+    adjusted[ref_cam] = 0.0
+    return adjusted, hints
+
+
+def _to_overlap_trim_offsets(offsets: dict[str, float]) -> dict[str, float]:
+    if not offsets:
+        return {}
+    min_offset = min(offsets.values())
+    return {cam_id: float(offset - min_offset) for cam_id, offset in offsets.items()}
+
+
+def _json_safe(value):
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _save_sync_report(
+    session_dir: Path,
+    *,
+    requested_strategy: str,
+    selected_method: str,
+    input_mode: str,
+    anchor_video: str,
+    raw_offsets: dict[str, float],
+    final_offsets: dict[str, float],
+    frame_offsets: dict[str, int],
+    render_offsets: dict[str, float],
+    duration_hints: dict[str, dict[str, float | str]],
+    strategy_details: dict | None = None,
+    errors: list[str] | None = None,
+) -> Path:
+    report_path = session_dir / "sync_report.json"
+    report = {
+        "status": "success",
+        "method": selected_method,
+        "anchor_video": anchor_video,
+        "offsets": final_offsets,
+        "offset_units": "seconds",
+        "frame_offsets": frame_offsets,
+        "requested_strategy": requested_strategy,
+        "selected_method": selected_method,
+        "input_mode": input_mode,
+        "raw_offsets": raw_offsets,
+        "final_offsets": final_offsets,
+        "render_trim_offsets": render_offsets,
+        "duration_hints": duration_hints,
+        "strategy_details": strategy_details or {},
+        "errors": errors or [],
+    }
+    report_path.write_text(json.dumps(_json_safe(report), indent=2, allow_nan=False))
+    return report_path
+
+
+def _extract_sync_clips(
+    source_paths: dict[str, Path],
+    sync_clip_dir: Path,
+    duration_seconds: float = 10.0,
+) -> dict[str, Path]:
+    """
+    Create short, clean clips used only for offset discovery.
+
+    The returned files keep the same {cam_id}.mp4 naming expected by all sync
+    strategies. Full-length source_paths are left untouched for final alignment
+    and rendering.
+    """
+    if sync_clip_dir.exists():
+        shutil.rmtree(sync_clip_dir)
+    sync_clip_dir.mkdir(parents=True, exist_ok=True)
+
+    sync_clips: dict[str, Path] = {}
+    for cam_id, input_path in source_paths.items():
+        output_path = sync_clip_dir / f"{cam_id}.mp4"
+        has_audio = _has_audio_stream(input_path)
+        cmd = [
+            "ffmpeg", "-y",
+            "-fflags", "+genpts+igndts+discardcorrupt",
+            "-analyzeduration", "100M",
+            "-probesize", "100M",
+            "-i", str(input_path),
+            "-t", f"{duration_seconds:.3f}",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+        ]
+        if has_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+        else:
+            cmd.append("-an")
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+
+        logger.info(f"Creating {duration_seconds:.1f}s sync clip for {cam_id}: {output_path}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if (
+            result.returncode != 0
+            or not output_path.exists()
+            or output_path.stat().st_size == 0
+        ):
+            raise RuntimeError(
+                f"Could not create sync clip for {cam_id}. "
+                f"FFmpeg stderr: {result.stderr[-1000:]}"
+            )
+        sync_clips[cam_id] = output_path
+
+    if len(sync_clips) < 2:
+        raise RuntimeError("At least two sync clips are required to compute offsets.")
+
+    return sync_clips
+
+
+def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> tuple[dict[str, Path], str]:
     """
     Concatenate all chunks for each camera into a single full video.
 
@@ -111,7 +327,8 @@ def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str
     When no chunk directories exist, the pipeline can also process direct
     full video inputs from the session directory.
 
-    Returns dict cam_id -> full_video_path
+    Returns (dict cam_id -> full_video_path, input_mode), where input_mode is
+    "direct" for uploaded full videos and "chunks" for recorded chunk inputs.
     """
     full_videos: dict[str, Path] = {}
 
@@ -136,7 +353,7 @@ def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str
                 full_videos[cam_id] = repaired_path
             else:
                 logger.error(f"❌ Remux failed for {cam_id}. Skipping this camera.")
-        return full_videos
+        return full_videos, "direct"
 
     chunk_dirs = sorted(
         [d for d in session_dir.glob("chunk_*") if d.is_dir()],
@@ -236,7 +453,7 @@ def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str
             else:
                 logger.error(f"[{cam_id}] Binary concat fallback also failed")
 
-        return full_videos
+        return full_videos, "chunks"
 
     logger.info(f"No chunk directories found in {session_dir}. Checking for direct full session files.")
     for cam_id in cam_id_list:
@@ -262,7 +479,7 @@ def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> dict[str
         else:
             logger.error(f"❌ Remux failed for {cam_id}. Skipping this camera.")
 
-    return full_videos
+    return full_videos, "direct"
 
 
 def run_full_sync_pipeline(
@@ -281,6 +498,7 @@ def run_full_sync_pipeline(
 
     session_dir = storage / "raw" / session_id
     aligned_dir = (session_dir / "aligned").resolve()
+    sync_clip_dir = (session_dir / "sync_clips").resolve()
     synced_dir = (storage / "synced" / session_id).resolve()
 
     synced_dir.mkdir(parents=True, exist_ok=True)
@@ -295,7 +513,7 @@ def run_full_sync_pipeline(
         "session_id": session_id,
         "message": "Combining video chunks into full videos...",
     })
-    full_videos = _concat_camera_chunks(session_dir, cam_ids)
+    full_videos, input_mode = _concat_camera_chunks(session_dir, cam_ids)
     if not full_videos:
         raise RuntimeError(
             f"[{session_id}] No full videos created during concat step. "
@@ -319,9 +537,19 @@ def run_full_sync_pipeline(
             path.replace(new_path)
         canonical_paths[cam_id] = new_path
 
-    # Step 2: Compute offsets using full videos
+    # Step 2: Create short clips for fast offset discovery
+    logger.info(f"[{session_id}] Extracting first 10 seconds for synchronization...")
+    publish_event_sync({
+        "type": "optimizing",
+        "session_id": session_id,
+        "message": "Extracting 10-second sync clips...",
+    })
+    sync_clips = _extract_sync_clips(canonical_paths, sync_clip_dir, duration_seconds=10.0)
+    sync_cam_ids = [cam_id for cam_id in valid_cam_ids if cam_id in sync_clips]
+
+    # Step 3: Compute offsets using the short clips
     logger.info(
-        f"[{session_id}] Computing offsets from full videos "
+        f"[{session_id}] Computing offsets from 10-second clips "
         f"using {strategy_name} strategy..."
     )
     publish_event_sync({
@@ -330,11 +558,20 @@ def run_full_sync_pipeline(
         "message": f"Computing offsets using {strategy_name} strategy...",
     })
     strategy = get_sync_strategy(strategy_name)
-    offsets = strategy.compute_offsets(session_dir, valid_cam_ids)
+    raw_offsets = strategy.compute_offsets(sync_clip_dir, sync_cam_ids)
+    if input_mode == "chunks":
+        offsets, duration_hints = _apply_common_end_duration_hint(raw_offsets, canonical_paths, sync_cam_ids[0])
+    else:
+        offsets = dict(raw_offsets)
+        duration_hints = {}
+        logger.info(
+            f"[{session_id}] Direct-upload input detected; keeping raw sync offsets "
+            "instead of applying duration-based common-end correction."
+        )
     save_offsets(offsets, session_dir)
     logger.info(f"[{session_id}] Offsets saved: {offsets}")
 
-    # Step 3: Align full videos
+    # Step 4: Align full videos
     logger.info(f"[{session_id}] Aligning full videos...")
     publish_event_sync({
         "type": "aligning",
@@ -347,8 +584,32 @@ def run_full_sync_pipeline(
         shutil.rmtree(aligned_dir)
     aligned_dir.mkdir(parents=True, exist_ok=True)
 
+    render_offsets = _to_overlap_trim_offsets(offsets)
+    logger.info(f"[{session_id}] Render trim offsets: {render_offsets}")
+    anchor_cam_id = sync_cam_ids[0]
+    anchor_path = canonical_paths.get(anchor_cam_id, session_dir / f"{anchor_cam_id}.mp4")
+    anchor_fps = _probe_fps(anchor_path) or 30.0
+    frame_offsets = {
+        cam_id: int(round(float(offset) * anchor_fps))
+        for cam_id, offset in offsets.items()
+    }
+    _save_sync_report(
+        session_dir,
+        requested_strategy=strategy_name,
+        selected_method=getattr(strategy, "last_method", strategy_name),
+        input_mode=input_mode,
+        anchor_video=f"{anchor_cam_id}.mp4",
+        raw_offsets=raw_offsets,
+        final_offsets=offsets,
+        frame_offsets=frame_offsets,
+        render_offsets=render_offsets,
+        duration_hints=duration_hints,
+        strategy_details=getattr(strategy, "last_details", {}),
+        errors=getattr(strategy, "last_errors", []),
+    )
+
     aligned_paths: dict[str, Path] = {}
-    for cam_id, offset in offsets.items():
+    for cam_id, offset in render_offsets.items():
         input_path = canonical_paths.get(cam_id, session_dir / f"{cam_id}.mp4")
         aligned_file_path = aligned_dir / f"{cam_id}_aligned.mp4"
         if input_path.exists():
@@ -373,7 +634,7 @@ def run_full_sync_pipeline(
             f"See logger output above for FFmpeg stderr."
         )
 
-    # Step 4: Stitch
+    # Step 5: Stitch
     logger.info(f"[{session_id}] Stitching with layout={layout}...")
     publish_event_sync({
         "type": "stitching",
