@@ -7,11 +7,11 @@ import pytest
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
+TEST_DB_URL = "sqlite+aiosqlite:///./test_videosync.db"
+
 from app.main import app
 from app.database import Base, get_db
 from app.models import Session
-
-TEST_DB_URL = "sqlite+aiosqlite:///./test_videosync.db"
 
 engine = create_async_engine(TEST_DB_URL, echo=False)
 TestSessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)

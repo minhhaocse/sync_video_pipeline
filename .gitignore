@@ -67,5 +67,7 @@ desktop.ini
 *.crt
 secrets/
 .lt_subdomain
+
+# SeSyn-Net upstream checkout is auto-cloned at runtime and is too large to vendor.
 backend/app/services/sesyn_net_approach/Sync-Camera/
 cloudflared.exe

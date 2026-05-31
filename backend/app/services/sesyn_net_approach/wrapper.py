@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import logging
+import shutil
 from pathlib import Path
 from collections import defaultdict
 
@@ -21,6 +22,7 @@ _sesyn_dir_cache: Path | None = None
 _gcn_model_cache = None
 _pose_model_cache = None
 LAST_SYNC_DETAILS: dict = {}
+SYNC_CAMERA_REPO_URL = "https://github.com/Cocobaut/Sync-Camera.git"
 
 
 def _patch_cuda_noops_for_cpu(torch_module) -> None:
@@ -55,6 +57,49 @@ def _select_torch_device(torch_module):
     return torch_module.device("cpu")
 
 
+def _locate_sesyn_source(repo_dir: Path) -> Path | None:
+    """
+    Locate the SeSyn-Net source inside a cloned Sync-Camera checkout.
+
+    The upstream repository has existed in both flat and nested layouts, so do
+    not assume one exact directory name.
+    """
+    subdirs = (
+        [d for d in repo_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        if repo_dir.exists()
+        else []
+    )
+    candidates = [
+        repo_dir / "SeSyn-Net-main",
+        repo_dir,
+        *subdirs,
+    ]
+    for candidate in candidates:
+        if (candidate / "network").exists():
+            return candidate
+    return None
+
+
+def _clone_sync_camera(repo_dir: Path) -> None:
+    logger.info("Cloning Sync-Camera repository for SeSyn-Net...")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", SYNC_CAMERA_REPO_URL, str(repo_dir)],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace")
+        logger.error(f"Failed to clone Sync-Camera repository: {stderr}")
+        raise RuntimeError(
+            "Could not clone Sync-Camera repository. Ensure git is installed and "
+            "network access to GitHub is available."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("Timed out while cloning Sync-Camera repository.") from e
+
+
 def setup_sesyn_net() -> Path:
     """
     Ensures the Sync-Camera repository is cloned and its modules are in the Python path.
@@ -72,37 +117,24 @@ def setup_sesyn_net() -> Path:
     repo_dir = base_dir / "Sync-Camera"
 
     if not repo_dir.exists():
-        logger.info("Sync-Camera repository not found locally. Attempting to clone...")
-        try:
-            subprocess.run(
-                ["git", "clone", "https://github.com/Cocobaut/Sync-Camera.git", str(repo_dir)],
-                check=True,
-                capture_output=True,
-                timeout=120,
-            )
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to clone Sync-Camera repository: {e.stderr.decode('utf-8', errors='replace')}")
-            raise RuntimeError(
-                "Could not clone Sync-Camera repository. Ensure git is installed and network is available."
-            ) from e
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Timed out while cloning Sync-Camera repository.")
+        _clone_sync_camera(repo_dir)
 
-    # Flexibly locate the SeSyn-Net source — handles both flat and nested layouts
-    if (repo_dir / "SeSyn-Net-main" / "network").exists():
-        sesyn_main_dir = repo_dir / "SeSyn-Net-main"
-    elif (repo_dir / "network").exists():
-        sesyn_main_dir = repo_dir
-    else:
-        subdirs = [d for d in repo_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-        found = [d for d in subdirs if (d / "network").exists()]
-        if found:
-            sesyn_main_dir = found[0]
-        else:
-            raise FileNotFoundError(
-                f"Could not find SeSyn-Net source code in {repo_dir}. "
-                "Expected a 'network' sub-directory."
-            )
+    sesyn_main_dir = _locate_sesyn_source(repo_dir)
+    if sesyn_main_dir is None:
+        logger.warning(
+            "Sync-Camera exists at %s but does not contain SeSyn-Net source; "
+            "removing the incomplete checkout and cloning again.",
+            repo_dir,
+        )
+        shutil.rmtree(repo_dir, ignore_errors=True)
+        _clone_sync_camera(repo_dir)
+        sesyn_main_dir = _locate_sesyn_source(repo_dir)
+
+    if sesyn_main_dir is None:
+        raise FileNotFoundError(
+            f"Could not find SeSyn-Net source code in {repo_dir}. "
+            "Expected a 'network' sub-directory after cloning Sync-Camera."
+        )
 
     if str(sesyn_main_dir) not in sys.path:
         sys.path.insert(0, str(sesyn_main_dir))

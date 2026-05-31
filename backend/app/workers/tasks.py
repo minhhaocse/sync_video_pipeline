@@ -11,6 +11,37 @@ from app.diag_logger import log_diag
 
 logger = logging.getLogger(__name__)
 
+NON_RETRYABLE_SYNC_ERROR_MARKERS = (
+    "Audio for camera",
+    "appears to be silent",
+    "Global visual sync returned",
+    "near the",
+    "search boundary",
+    "MultiSyncVideo failed",
+    "Auto sync failed",
+    "Could not find SeSyn-Net source code",
+    "SeSyn-Net model weights not found",
+    "SeSyn-Net could not detect reliable human pose",
+    "SeSyn-Net requires at least 2 cameras",
+    "SeSyn-Net could not find videos",
+    "SeSyn-Net: no sliding window measurements",
+    "Feature sync requires",
+    "Feature sync found empty/unreadable videos",
+    "At least two sync clips are required",
+)
+
+
+def _should_retry_pipeline_error(exc: Exception) -> bool:
+    """
+    Celery retries help transient infrastructure failures, but deterministic
+    sync/configuration failures only repeat the same expensive work.
+    """
+    if isinstance(exc, (ValueError, FileNotFoundError)):
+        return False
+
+    message = str(exc)
+    return not any(marker in message for marker in NON_RETRYABLE_SYNC_ERROR_MARKERS)
+
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
 def process_chunk_set(
@@ -76,6 +107,9 @@ def process_chunk_set(
             "chunk_index": chunk_index,
             "message": str(exc),
         })
+        if not _should_retry_pipeline_error(exc):
+            logger.error("[Task] Non-retryable sync failure; not retrying chunk task.")
+            raise
         raise self.retry(exc=exc)
 
 
@@ -291,13 +325,17 @@ def process_full_session(
 
         # -- Mark as failed in DB --
         try:
+            from app.models import Session
             with SyncSessionLocal() as db:
                 mv = db.query(MasterVideo).filter_by(session_id=uuid.UUID(session_id)).first()
                 if mv:
                     mv.status = "failed"
                     mv.error = error_msg
                     mv.finished_at = datetime.now(timezone.utc)
-                    db.commit()
+                session = db.query(Session).filter_by(id=uuid.UUID(session_id)).first()
+                if session:
+                    session.status = "failed"
+                db.commit()
         except Exception as db_err:
             logger.warning(f"[Full Task] Could not update DB status to failed: {db_err}")
 
@@ -306,4 +344,7 @@ def process_full_session(
             "session_id": session_id,
             "message": f"Full sync failed: {error_msg}",
         })
+        if not _should_retry_pipeline_error(exc):
+            logger.error("[Full Task] Non-retryable sync failure; not retrying full task.")
+            raise
         raise self.retry(exc=exc)

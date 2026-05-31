@@ -18,8 +18,12 @@ from app.services.feature_based_approach.OTP import (
 
 logger = logging.getLogger(__name__)
 
-MAX_FEATURE_OFFSET_SECONDS = 5.0
+MAX_FEATURE_OFFSET_SECONDS = 15.0
 MIN_MATCHED_TRAJECTORIES = 8
+FRAME_SIMILARITY_SAMPLE_RATE = 3.0
+MIN_FRAME_SIMILARITY_OVERLAP_SECONDS = 3.0
+FRAME_SIMILARITY_EDGE_WEIGHT = 0.35
+FRAME_SIMILARITY_MOTION_WEIGHT = 0.45
 
 
 def _safe_fundamental_matrix(*args):
@@ -34,7 +38,7 @@ def _estimate_offsets_by_frame_similarity(
     capture_files: dict[str, Path],
     cam_ids: list[str],
     fps: float,
-    sample_rate: float = 2.0,
+    sample_rate: float = FRAME_SIMILARITY_SAMPLE_RATE,
     max_shift_seconds: float = MAX_FEATURE_OFFSET_SECONDS,
 ) -> dict[str, float]:
     """
@@ -44,11 +48,26 @@ def _estimate_offsets_by_frame_similarity(
     This is less ambitious than trajectory matching, but it gives us a stable
     offset estimate for same-scene clips instead of crashing on weak features.
     """
-    def load_series(path: Path) -> list[np.ndarray]:
+    def _zscore(values: np.ndarray) -> np.ndarray:
+        values = values.astype(np.float32)
+        std = float(np.std(values))
+        if std < 1e-6:
+            return values - float(np.mean(values))
+        return (values - float(np.mean(values))) / std
+
+    def _series_distance(left: np.ndarray, right: np.ndarray) -> float:
+        if left.size < 2 or right.size < 2:
+            return float("inf")
+        return float(np.mean(np.abs(_zscore(left) - _zscore(right))))
+
+    def load_series(path: Path) -> dict[str, list[np.ndarray] | np.ndarray]:
         cap = cv2.VideoCapture(str(path))
         src_fps = cap.get(cv2.CAP_PROP_FPS) or fps or 30.0
         step = max(1, int(round(src_fps / sample_rate)))
-        series: list[np.ndarray] = []
+        thumbs: list[np.ndarray] = []
+        edges: list[float] = []
+        motions: list[float] = []
+        prev_thumb: np.ndarray | None = None
         frame_idx = 0
         while True:
             ret, frame = cap.read()
@@ -58,49 +77,97 @@ def _estimate_offsets_by_frame_similarity(
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 thumb = cv2.resize(gray, (96, 54), interpolation=cv2.INTER_AREA)
                 thumb = cv2.equalizeHist(thumb).astype(np.float32) / 255.0
-                series.append(thumb.reshape(-1))
+                edge = cv2.Canny((thumb * 255).astype(np.uint8), 80, 160)
+                edges.append(float(np.mean(edge > 0)))
+                if prev_thumb is None:
+                    motions.append(0.0)
+                else:
+                    motions.append(float(np.mean(np.abs(thumb - prev_thumb))))
+                prev_thumb = thumb
+                thumbs.append(thumb.reshape(-1))
             frame_idx += 1
         cap.release()
-        return series
+        return {
+            "thumbs": thumbs,
+            "edges": np.asarray(edges, dtype=np.float32),
+            "motions": np.asarray(motions, dtype=np.float32),
+        }
 
     series_by_cam = {cam_id: load_series(capture_files[cam_id]) for cam_id in cam_ids}
     ref_series = series_by_cam[cam_ids[0]]
-    if len(ref_series) < 3:
+    ref_thumbs = ref_series["thumbs"]
+    if len(ref_thumbs) < 3:
         raise ValueError("Frame-similarity fallback needs at least 3 sampled reference frames.")
 
     max_lag = int(round(max_shift_seconds * sample_rate))
+    shortest_series = min(len(series_by_cam[cam_id]["thumbs"]) for cam_id in cam_ids)
+    min_overlap = min(
+        shortest_series,
+        max(3, int(round(MIN_FRAME_SIMILARITY_OVERLAP_SECONDS * sample_rate))),
+    )
     offsets = {cam_ids[0]: 0.0}
 
     for cam_id in cam_ids[1:]:
         cam_series = series_by_cam[cam_id]
-        if len(cam_series) < 3:
+        cam_thumbs = cam_series["thumbs"]
+        if len(cam_thumbs) < 3:
             raise ValueError(f"Frame-similarity fallback needs at least 3 sampled frames for {cam_id}.")
 
         best_lag = 0
         best_score = float("inf")
+        second_best_score = float("inf")
         for lag in range(-max_lag, max_lag + 1):
             ref_start = max(0, -lag)
             cam_start = max(0, lag)
-            overlap = min(len(ref_series) - ref_start, len(cam_series) - cam_start)
-            if overlap < 3:
+            overlap = min(len(ref_thumbs) - ref_start, len(cam_thumbs) - cam_start)
+            if overlap < min_overlap:
                 continue
 
             diffs = [
-                float(np.mean(np.abs(ref_series[ref_start + i] - cam_series[cam_start + i])))
+                float(np.mean(np.abs(ref_thumbs[ref_start + i] - cam_thumbs[cam_start + i])))
                 for i in range(overlap)
             ]
-            score = float(np.median(diffs))
+            thumb_score = float(np.median(diffs))
+            ref_slice = slice(ref_start, ref_start + overlap)
+            cam_slice = slice(cam_start, cam_start + overlap)
+            edge_score = _series_distance(
+                ref_series["edges"][ref_slice],
+                cam_series["edges"][cam_slice],
+            )
+            motion_score = _series_distance(
+                ref_series["motions"][ref_slice],
+                cam_series["motions"][cam_slice],
+            )
+
+            if not np.isfinite(edge_score):
+                edge_score = thumb_score
+            if not np.isfinite(motion_score):
+                motion_score = thumb_score
+
+            overlap_seconds = overlap / sample_rate
+            short_overlap_penalty = 1.0 + max(0.0, MIN_FRAME_SIMILARITY_OVERLAP_SECONDS - overlap_seconds) * 0.1
+            score = (
+                thumb_score
+                + FRAME_SIMILARITY_EDGE_WEIGHT * edge_score
+                + FRAME_SIMILARITY_MOTION_WEIGHT * motion_score
+            ) * short_overlap_penalty
             if score < best_score:
+                second_best_score = best_score
                 best_score = score
                 best_lag = lag
+            elif score < second_best_score:
+                second_best_score = score
 
         if not np.isfinite(best_score):
             raise ValueError(f"Frame-similarity fallback could not compare {cam_id}.")
 
         offsets[cam_id] = float(best_lag / sample_rate)
+        boundary_ratio = abs(best_lag) / max_lag if max_lag else 0.0
+        score_margin = second_best_score - best_score if np.isfinite(second_best_score) else float("inf")
         logger.info(
             f"Frame-similarity fallback offset for {cam_id}: "
-            f"{offsets[cam_id]:.3f}s (lag={best_lag}, score={best_score:.4f})"
+            f"{offsets[cam_id]:.3f}s (lag={best_lag}, score={best_score:.4f}, "
+            f"margin={score_margin:.4f}, boundary={boundary_ratio:.2f})"
         )
 
     return offsets

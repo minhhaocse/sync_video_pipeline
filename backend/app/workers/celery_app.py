@@ -24,8 +24,8 @@ celery_app.conf.update(
     task_default_retry_delay=10,
     # Expire results after 1 hour to prevent Redis memory bloat
     result_expires=3600,
-    # Soft time limit: warn at 10 min; hard kill at 15 min
+    # Soft time limit: warn at 15 min; hard kill at 30 min
     # (SeSyn-Net on CPU can take a few minutes for long videos)
-    task_soft_time_limit=600,
-    task_time_limit=900,
+    task_soft_time_limit=900,
+    task_time_limit=1800,
 )

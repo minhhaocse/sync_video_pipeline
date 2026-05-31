@@ -6,6 +6,14 @@ from app.config import get_settings
 
 settings = get_settings()
 
+
+def _to_sync_database_url(database_url: str) -> str:
+    if database_url.startswith("postgresql+asyncpg://"):
+        return database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    if database_url.startswith("sqlite+aiosqlite://"):
+        return database_url.replace("sqlite+aiosqlite://", "sqlite://", 1)
+    return database_url
+
 # ── Async engine (used by FastAPI) ────────────────────────────────────────────
 engine = create_async_engine(
     settings.database_url,
@@ -21,9 +29,8 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 # ── Sync engine (used by Celery workers) ──────────────────────────────────────
-# Celery workers are synchronous; they cannot use asyncpg.
-# We derive a psycopg2 URL from the asyncpg one.
-_sync_url = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+# Celery workers are synchronous; they cannot use async DBAPI drivers.
+_sync_url = _to_sync_database_url(settings.database_url)
 sync_engine = create_engine(_sync_url, pool_pre_ping=True)
 
 SyncSessionLocal = sessionmaker(bind=sync_engine, expire_on_commit=False)

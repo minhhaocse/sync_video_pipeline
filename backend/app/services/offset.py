@@ -26,6 +26,14 @@ def _extract_audio_wav(video_path: Path, out_wav: Path) -> None:
     )
 
 
+def _has_audio_stream(video_path: Path) -> bool:
+    try:
+        probe = ffmpeg.probe(str(video_path))
+    except ffmpeg.Error:
+        return False
+    return any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
+
+
 def compute_offsets(chunk_dir: Path, cam_ids: list[str], reference_cam: str = None) -> dict[str, float]:
     """
     Compute time offsets for each camera relative to the reference camera.
@@ -64,6 +72,12 @@ def compute_offsets(chunk_dir: Path, cam_ids: list[str], reference_cam: str = No
                 error_msg = f"No input file found for camera {cam_id} in {chunk_dir} (tried .webm, .mp4, etc.)"
                 logger.error(error_msg)
                 raise FileNotFoundError(error_msg)
+
+            if not _has_audio_stream(video_path):
+                raise ValueError(
+                    f"Audio for camera {cam_id} is missing. "
+                    "Cannot reliably compute audio-based offsets."
+                )
 
             wav_path = chunk_dir / f"{cam_id}_audio.wav"
             wav_paths_to_cleanup.append(wav_path)

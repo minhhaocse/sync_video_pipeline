@@ -311,6 +311,18 @@ def _extract_sync_clips(
     return sync_clips
 
 
+def _sync_clip_duration_for_strategy(strategy_name: str) -> float:
+    """
+    MultiSyncVideo needs enough overlapping visual content after manual-start
+    offsets. Keep SeSyn-Net direct runs shorter because pose inference is the
+    expensive stage.
+    """
+    normalized = strategy_name.lower()
+    if normalized in {"multisyncvideo", "multisync", "multividsynch", "multividsync", "auto", "default"}:
+        return 20.0
+    return 10.0
+
+
 def _concat_camera_chunks(session_dir: Path, cam_id_list: list[str]) -> tuple[dict[str, Path], str]:
     """
     Concatenate all chunks for each camera into a single full video.
@@ -538,18 +550,19 @@ def run_full_sync_pipeline(
         canonical_paths[cam_id] = new_path
 
     # Step 2: Create short clips for fast offset discovery
-    logger.info(f"[{session_id}] Extracting first 10 seconds for synchronization...")
+    sync_clip_duration = _sync_clip_duration_for_strategy(strategy_name)
+    logger.info(f"[{session_id}] Extracting first {sync_clip_duration:.0f} seconds for synchronization...")
     publish_event_sync({
         "type": "optimizing",
         "session_id": session_id,
-        "message": "Extracting 10-second sync clips...",
+        "message": f"Extracting {sync_clip_duration:.0f}-second sync clips...",
     })
-    sync_clips = _extract_sync_clips(canonical_paths, sync_clip_dir, duration_seconds=10.0)
+    sync_clips = _extract_sync_clips(canonical_paths, sync_clip_dir, duration_seconds=sync_clip_duration)
     sync_cam_ids = [cam_id for cam_id in valid_cam_ids if cam_id in sync_clips]
 
     # Step 3: Compute offsets using the short clips
     logger.info(
-        f"[{session_id}] Computing offsets from 10-second clips "
+        f"[{session_id}] Computing offsets from {sync_clip_duration:.0f}-second clips "
         f"using {strategy_name} strategy..."
     )
     publish_event_sync({
