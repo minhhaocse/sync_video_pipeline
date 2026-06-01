@@ -325,7 +325,7 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
 
         # The caller provides a short sync clip, so this stays bounded even for
         # long source videos.
-        representative_frames = extract_representative_frames(video_path, segment_duration_seconds=10.0, fps=fps)
+        representative_frames = extract_representative_frames(video_path, segment_duration_seconds=20.0, fps=fps)
         logger.info(f"Processing {len(representative_frames)} representative frames for {cam_name}")
         
         for frame in tqdm(representative_frames, desc=f"Analyzing {cam_name}"):
