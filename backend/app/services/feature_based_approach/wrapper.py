@@ -12,8 +12,7 @@ from app.services.feature_based_approach.OTP import (
     construct_trajectories,
     compute_fundamental_matrix,
     filter_trajectories,
-    match_trajectories,
-    synchronize_videos
+    match_trajectories
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +23,10 @@ FRAME_SIMILARITY_SAMPLE_RATE = 3.0
 MIN_FRAME_SIMILARITY_OVERLAP_SECONDS = 3.0
 FRAME_SIMILARITY_EDGE_WEIGHT = 0.35
 FRAME_SIMILARITY_MOTION_WEIGHT = 0.45
+FEATURE_MOTION_SAMPLE_RATE = 3.0
+FEATURE_MOTION_MIN_OVERLAP_SECONDS = 3.0
+FEATURE_MOTION_COUNT_WEIGHT = 0.25
+FEATURE_MOTION_DISPLACEMENT_WEIGHT = 0.75
 
 
 def _safe_fundamental_matrix(*args):
@@ -172,6 +175,143 @@ def _estimate_offsets_by_frame_similarity(
 
     return offsets
 
+
+def _estimate_offsets_by_feature_motion(
+    capture_files: dict[str, Path],
+    cam_ids: list[str],
+    fps: float,
+    sample_rate: float = FEATURE_MOTION_SAMPLE_RATE,
+    max_shift_seconds: float = MAX_FEATURE_OFFSET_SECONDS,
+) -> dict[str, float]:
+    """
+    Estimate temporal offsets from feature-motion signatures.
+
+    This keeps the useful MultiVidSync idea (feature motion over time), but the
+    final offset is computed by an explicit temporal lag search. Positive
+    offsets follow the pipeline convention: trim that camera.
+    """
+    def _zscore(values: np.ndarray) -> np.ndarray:
+        values = values.astype(np.float32)
+        std = float(np.std(values))
+        if std < 1e-6:
+            return values - float(np.mean(values))
+        return (values - float(np.mean(values))) / std
+
+    def _signature_distance(
+        ref_motion: np.ndarray,
+        cam_motion: np.ndarray,
+        ref_counts: np.ndarray,
+        cam_counts: np.ndarray,
+    ) -> float:
+        if ref_motion.size < 2 or cam_motion.size < 2:
+            return float("inf")
+        motion_distance = float(np.mean(np.abs(_zscore(ref_motion) - _zscore(cam_motion))))
+        count_distance = float(np.mean(np.abs(_zscore(ref_counts) - _zscore(cam_counts))))
+        return (
+            FEATURE_MOTION_DISPLACEMENT_WEIGHT * motion_distance
+            + FEATURE_MOTION_COUNT_WEIGHT * count_distance
+        )
+
+    def load_signature(path: Path) -> dict[str, np.ndarray]:
+        cap = cv2.VideoCapture(str(path))
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or fps or 30.0
+        step = max(1, int(round(src_fps / sample_rate)))
+
+        sampled_keypoints = []
+        sampled_descriptors = []
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0:
+                keypoints, descriptors = detect_features(frame)
+                sampled_keypoints.append(keypoints or [])
+                sampled_descriptors.append(descriptors)
+            frame_idx += 1
+        cap.release()
+
+        counts = np.asarray([len(kp) for kp in sampled_keypoints], dtype=np.float32)
+        motion_values: list[float] = [0.0]
+        for idx in range(1, len(sampled_keypoints)):
+            prev_kp = sampled_keypoints[idx - 1]
+            curr_kp = sampled_keypoints[idx]
+            matches = match_features(sampled_descriptors[idx - 1], sampled_descriptors[idx])
+            displacements = []
+            for match in matches:
+                if match.queryIdx >= len(prev_kp) or match.trainIdx >= len(curr_kp):
+                    continue
+                prev_pt = np.asarray(prev_kp[match.queryIdx].pt, dtype=np.float32)
+                curr_pt = np.asarray(curr_kp[match.trainIdx].pt, dtype=np.float32)
+                displacements.append(float(np.linalg.norm(curr_pt - prev_pt)))
+            motion_values.append(float(np.median(displacements)) if displacements else 0.0)
+
+        return {
+            "motion": np.asarray(motion_values, dtype=np.float32),
+            "counts": counts,
+        }
+
+    signatures = {cam_id: load_signature(capture_files[cam_id]) for cam_id in cam_ids}
+    ref_signature = signatures[cam_ids[0]]
+    ref_motion = ref_signature["motion"]
+    ref_counts = ref_signature["counts"]
+    if len(ref_motion) < 3:
+        raise ValueError("Feature-motion sync needs at least 3 sampled reference frames.")
+
+    max_lag = int(round(max_shift_seconds * sample_rate))
+    shortest_series = min(len(signatures[cam_id]["motion"]) for cam_id in cam_ids)
+    min_overlap = min(
+        shortest_series,
+        max(3, int(round(FEATURE_MOTION_MIN_OVERLAP_SECONDS * sample_rate))),
+    )
+    offsets = {cam_ids[0]: 0.0}
+
+    for cam_id in cam_ids[1:]:
+        cam_signature = signatures[cam_id]
+        cam_motion = cam_signature["motion"]
+        cam_counts = cam_signature["counts"]
+        if len(cam_motion) < 3:
+            raise ValueError(f"Feature-motion sync needs at least 3 sampled frames for {cam_id}.")
+
+        best_lag = 0
+        best_score = float("inf")
+        second_best_score = float("inf")
+        for lag in range(-max_lag, max_lag + 1):
+            ref_start = max(0, -lag)
+            cam_start = max(0, lag)
+            overlap = min(len(ref_motion) - ref_start, len(cam_motion) - cam_start)
+            if overlap < min_overlap:
+                continue
+
+            ref_slice = slice(ref_start, ref_start + overlap)
+            cam_slice = slice(cam_start, cam_start + overlap)
+            score = _signature_distance(
+                ref_motion[ref_slice],
+                cam_motion[cam_slice],
+                ref_counts[ref_slice],
+                cam_counts[cam_slice],
+            )
+            if score < best_score:
+                second_best_score = best_score
+                best_score = score
+                best_lag = lag
+            elif score < second_best_score:
+                second_best_score = score
+
+        if not np.isfinite(best_score):
+            raise ValueError(f"Feature-motion sync could not compare {cam_id}.")
+
+        offsets[cam_id] = float(best_lag / sample_rate)
+        boundary_ratio = abs(best_lag) / max_lag if max_lag else 0.0
+        score_margin = second_best_score - best_score if np.isfinite(second_best_score) else float("inf")
+        logger.info(
+            f"Feature-motion offset for {cam_id}: {offsets[cam_id]:.3f}s "
+            f"(lag={best_lag}, score={best_score:.4f}, margin={score_margin:.4f}, "
+            f"boundary={boundary_ratio:.2f})"
+        )
+
+    return offsets
+
 def extract_representative_frames(video_path: Path, segment_duration_seconds: float = 10.0, fps: float = 30.0):
     """
     Extract frames from the first and last segments of a video.
@@ -279,12 +419,8 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
         if height <= 0 or width <= 0:
             raise ValueError(f"Could not read dimensions for {video_path}")
 
-        left_percent = 0.15 
-        roi_height = height
-        roi_start_x = int(width * left_percent)
-        roi_width = width - roi_start_x
-        roi_start = (0, roi_start_x)
-        roi_size = (roi_height, roi_width)
+        roi_start = (0, 0)
+        roi_size = (height, width)
 
         best_frame = None
         best_kp = None
@@ -366,6 +502,18 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
 
     sync_dict = {ref_name: 0.0}
 
+    # Pre-compute feature-motion offsets ONCE for all cameras before the loop.
+    # Previously this was called inside the per-camera loop, causing a full
+    # video scan of all cameras to repeat N-1 times redundantly (9x for 10 cams).
+    try:
+        cached_motion_offsets = _estimate_offsets_by_feature_motion(capture_files, cam_ids, fps)
+    except Exception:
+        logger.warning(
+            "Feature-motion temporal lag search failed; using frame-similarity fallback for all cameras.",
+            exc_info=True,
+        )
+        return _estimate_offsets_by_frame_similarity(capture_files, cam_ids, fps)
+
     for i in range(1, len(cam_ids)):
         cam_name = cam_ids[i]
         if cam_name not in trajectories_data or not trajectories_data[cam_name]:
@@ -384,21 +532,16 @@ def compute_feature_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, fl
             )
             return _estimate_offsets_by_frame_similarity(capture_files, cam_ids, fps)
 
-        offsets = synchronize_videos(matched_trajectories)
-        offset_array = np.asarray(offsets, dtype=np.float64).reshape(-1)
-        if offset_array.size < 2 or not np.all(np.isfinite(offset_array[:2])):
-            logger.warning(f"Feature sync solver returned invalid offsets for {cam_name}: {offsets}; trying frame-similarity fallback.")
-            return _estimate_offsets_by_frame_similarity(capture_files, cam_ids, fps)
-
-        ref_offset = offset_array[0]
-        adjusted_offset = offset_array[1] - ref_offset
-        offset_seconds = float(adjusted_offset / fps)
+        logger.info(
+            f"Feature sync matched {len(matched_trajectories)} trajectories for {cam_name}; "
+            "using cached feature-motion offset."
+        )
+        offset_seconds = float(cached_motion_offsets[cam_name])
         if abs(offset_seconds) > MAX_FEATURE_OFFSET_SECONDS:
-            logger.warning(
-                f"Feature sync produced implausible offset for {cam_name}: {offset_seconds:.3f}s; "
-                "trying frame-similarity fallback."
+            raise ValueError(
+                f"Feature sync produced implausible offset for {cam_name}: "
+                f"{offset_seconds:.3f}s."
             )
-            return _estimate_offsets_by_frame_similarity(capture_files, cam_ids, fps)
 
         sync_dict[cam_name] = offset_seconds
 

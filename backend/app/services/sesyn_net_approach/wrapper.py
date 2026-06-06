@@ -203,10 +203,13 @@ def extract_keypoints_for_video(video_path: Path, model) -> np.ndarray:
 
     all_frames_data = []
     for result in results:
+        kpts = np.zeros((17, 3), dtype=np.float32)
         if result.keypoints is not None and len(result.keypoints.data) > 0:
-            kpts = result.keypoints.data[0].cpu().numpy()  # (17, 3)
-        else:
-            kpts = np.zeros((17, 3), dtype=np.float32)
+            raw_kpts = result.keypoints.data[0].cpu().numpy()
+            if raw_kpts.shape == (17, 3):
+                kpts = raw_kpts
+            else:
+                logger.debug(f"Ignoring malformed keypoints with shape {raw_kpts.shape}")
         all_frames_data.append(kpts)
 
     if not all_frames_data:
@@ -403,8 +406,8 @@ def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, floa
         raise ValueError(f"SeSyn-Net could not find videos for cameras: {missing}")
 
     # ── Sliding window GCN inference ────────────────────────────────────────────
-    window_size = 120
-    stride = 30
+    window_size = 80   # reduced from 120 to support 15fps short-clip datasets (~5s)
+    stride = 20         # reduced from 30, keeps the same 4:1 window/stride ratio
     root_id = cam_ids[0]
 
     # Use the shortest available sequence to bound the window loop
@@ -422,24 +425,28 @@ def compute_sesyn_offsets(chunk_dir: Path, cam_ids: list[str]) -> dict[str, floa
     for start in range(0, total_frames - window_size + 1, stride):
         end = start + window_size
 
+        # Precompute GCN embeddings for this window for all available cameras (O(N) passes instead of O(N^2))
+        window_embeddings = {}
+        for cid in cam_ids:
+            if cid not in cam_data:
+                continue
+            
+            # Slice window: (3, 17, T, 1) -> (1, 3, T, 17, 1) [B, C, T, V, M]
+            sub_d = cam_data[cid][:, :, start:end, :]
+            sub_d = np.expand_dims(np.transpose(sub_d, (0, 2, 1, 3)), axis=0)
+            tensor = torch.tensor(sub_d, dtype=torch.float32).to(device)
+            
+            with torch.no_grad():
+                window_embeddings[cid] = gcn_model(tensor)
+
+        # Compute pairwise offsets using precomputed embeddings
         for i, cid1 in enumerate(cam_ids):
             for j, cid2 in enumerate(cam_ids):
-                if i >= j or cid1 not in cam_data or cid2 not in cam_data:
+                if i >= j or cid1 not in window_embeddings or cid2 not in window_embeddings:
                     continue
 
-                # Slice window: (3, 17, T, 1) -> (1, 3, T, 17, 1) [B, C, T, V, M]
-                sub_d1 = cam_data[cid1][:, :, start:end, :]
-                sub_d2 = cam_data[cid2][:, :, start:end, :]
-
-                sub_d1 = np.expand_dims(np.transpose(sub_d1, (0, 2, 1, 3)), axis=0)
-                sub_d2 = np.expand_dims(np.transpose(sub_d2, (0, 2, 1, 3)), axis=0)
-
-                tensor1 = torch.tensor(sub_d1, dtype=torch.float32).to(device)
-                tensor2 = torch.tensor(sub_d2, dtype=torch.float32).to(device)
-
-                with torch.no_grad():
-                    out1 = gcn_model(tensor1)
-                    out2 = gcn_model(tensor2)
+                out1 = window_embeddings[cid1]
+                out2 = window_embeddings[cid2]
 
                 label = torch.zeros(1).to(device)
                 predicted_frames = corresponding(out1, out2, label)
